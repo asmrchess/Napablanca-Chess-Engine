@@ -1,0 +1,3186 @@
+// ============================================================
+// MICRO:BIT CHESS
+// Full engine — board representation, move generation, search,
+// evaluation. Reflects every fix/addition made so far:
+//   - bishop/rook/queen sliding-move generation fix
+//   - search()/findBestMove() rewritten to fix the save/restore
+//     corruption bug (global variables reused across recursion
+//     levels of the same color parity)
+//   - move ordering (captures/promotions first)
+//   - quiescence search at the horizon
+//   - time-budgeted iterative deepening (findBestMoveTimed)
+//   - "attacking enemy pieces" evaluation sign fix
+//   - castling heuristic: reward ACTUALLY castling, mildly
+//     penalize losing castling rights without having castled
+//
+// No joystick or OLED yet. The built-in micro:bit display is
+// used for simple testing via testGame().
+//
+// Board numbering:
+// 0  1  2  3  4  5  6  7   = a8 ... h8
+// 8  9 10 11 12 13 14 15   = a7 ... h7
+// ...
+// 56 57 58 59 60 61 62 63  = a1 ... h1
+//
+// Positive pieces = White, Negative pieces = Black
+// 0 empty, 1 pawn, 2 knight, 3 bishop, 4 rook, 5 queen, 6 king
+// ============================================================
+
+// ------------------------------------------------------------
+// PIECES / GAME STATE
+// ------------------------------------------------------------
+let EMPTY = 0
+let PAWN = 0
+let KNIGHT = 0
+let BISHOP = 0
+let ROOK = 0
+let QUEEN = 0
+let KING = 0
+
+let board: number[] = []
+let whiteToMove = false
+let whiteCastleKing = false
+let whiteCastleQueen = false
+let blackCastleKing = false
+let blackCastleQueen = false
+let whiteHasCastled = false
+let blackHasCastled = false
+let enPassant = 0
+
+// Move lists (parallel arrays)
+let movesFrom: number[] = []
+let movesTo: number[] = []
+let movesPromotion: number[] = []
+let movesCastle: number[] = []
+let movesEnPassant: boolean[] = []
+
+// ------------------------------------------------------------
+// PER-PLY REUSABLE BUFFERS
+//
+// The search used to allocate brand-new move-list arrays and a brand-new
+// board-copy array at EVERY node it visited -- tens of thousands of small
+// arrays per move decision, which on a memory-constrained device like the
+// micro:bit can exhaust or fragment the heap even though each one gets
+// garbage collected (this was traced to the "020 / out of memory" panic).
+// Since the search only ever has ONE node "active" at any given ply at a
+// time (plain depth-first recursion, nothing concurrent), we only need
+// ONE buffer PER PLY LEVEL, reused by every node that ever visits that
+// ply, instead of one buffer per node. searchPly tracks how many real
+// moves deep the current search line is (root = 0), and is the index
+// into these pools. MAX_PLY is a hard safety cap -- normal play never
+// gets remotely close to it, but it guarantees we can never index past
+// the end of a pool array no matter how deep check extensions or
+// quiescence captures chain together.
+let MAX_PLY = 28
+let searchPly = 0
+let moveFromPool: number[][] = []
+let moveToPool: number[][] = []
+let movePromotionPool: number[][] = []
+let moveCastlePool: number[][] = []
+let moveEPPool: boolean[][] = []
+let boardPool: number[][] = []
+// orderMoveIndices() (called once per search/quiesce node, to sort that
+// node's moves before trying them) and seeCaptureValue() (called once
+// per candidate capture, to score it for ordering) each used to build
+// their own fresh arrays too -- the same per-ply reuse treatment as the
+// move-list pools above.
+let orderPool: number[][] = []
+let tacticalValuePool: number[][] = []
+let gainPool: number[][] = []
+
+// Reused by evaluate()'s pawn-structure section instead of a fresh
+// [0,0,0,0,0,0,0,0] literal every call -- reset to zero at the start of
+// each evaluate() rather than reallocated.
+let whitePawnsOnFile: number[] = [0, 0, 0, 0, 0, 0, 0, 0]
+let blackPawnsOnFile: number[] = [0, 0, 0, 0, 0, 0, 0, 0]
+// A pure lookup constant (passed-pawn bonus by distance from promotion)
+// -- was being rebuilt as a fresh array every evaluate() call for no
+// reason, since its values never change.
+let passedBonusByDistance: number[] = [0, 130, 90, 60, 35, 18, 8, 0]
+
+// Reused by evaluate()'s THREATS section (via buildAttackMap(), see below)
+// instead of calling the expensive squareAttacked() scan once per piece on
+// the board (up to ~30 times per evaluate() call, each one itself scanning
+// most of the board outward from that square). Fixed 64-length arrays,
+// like whitePawnsOnFile/blackPawnsOnFile above -- allocated once, contents
+// overwritten in place on every use, never resized.
+let attackMapWhite: boolean[] = [false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false]
+let attackMapBlack: boolean[] = [false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false]
+
+// Builds outMap[0..63] = true wherever a piece of the given color attacks
+// that square, replicating squareAttacked()'s exact rules (same pawn
+// direction, same "a slider's ray stops at -- but includes -- the first
+// piece it hits, friend or foe" behavior, same knight/king offsets) but
+// computed ATTACKER-first in one pass over the board, instead of asking
+// "is square X attacked?" freshly (a fresh scan back out from X) for every
+// one of the up to ~30 pieces on the board. Same answers, far less work.
+function buildAttackMap (byWhite: boolean, outMap: boolean[]): void {
+    for (let z6 = 0; z6 <= 63; z6++) {
+        outMap[z6] = false
+    }
+    for (let s = 0; s <= 63; s++) {
+        let p3 = board[s]
+        if (p3 == EMPTY) { continue }
+        if ((p3 > 0) != byWhite) { continue }
+        let atype2 = Math.abs(p3)
+        let sr = row(s)
+        let sc = col(s)
+        if (atype2 == PAWN) {
+            let dr5 = byWhite ? -1 : 1
+            if (onBoard(sr + dr5, sc - 1)) { outMap[squareFromRC(sr + dr5, sc - 1)] = true }
+            if (onBoard(sr + dr5, sc + 1)) { outMap[squareFromRC(sr + dr5, sc + 1)] = true }
+        } else if (atype2 == KNIGHT) {
+            for (let m2 = 0; m2 <= 7; m2++) {
+                let nr5 = sr + knightR[m2]
+                let nc5 = sc + knightC[m2]
+                if (onBoard(nr5, nc5)) { outMap[squareFromRC(nr5, nc5)] = true }
+            }
+        } else if (atype2 == KING) {
+            for (let dr6 = -1; dr6 <= 1; dr6++) {
+                for (let dc6 = -1; dc6 <= 1; dc6++) {
+                    if (dr6 == 0 && dc6 == 0) { continue }
+                    let nr6 = sr + dr6
+                    let nc6 = sc + dc6
+                    if (onBoard(nr6, nc6)) { outMap[squareFromRC(nr6, nc6)] = true }
+                }
+            }
+        } else {
+            if (atype2 == BISHOP || atype2 == QUEEN) {
+                for (let d2 = 0; d2 <= 3; d2++) {
+                    let nr7 = sr + diagR[d2]
+                    let nc7 = sc + diagC[d2]
+                    while (onBoard(nr7, nc7)) {
+                        let sq7 = squareFromRC(nr7, nc7)
+                        outMap[sq7] = true
+                        if (board[sq7] != EMPTY) { break }
+                        nr7 += diagR[d2]
+                        nc7 += diagC[d2]
+                    }
+                }
+            }
+            if (atype2 == ROOK || atype2 == QUEEN) {
+                for (let e2 = 0; e2 <= 3; e2++) {
+                    let nr8 = sr + straightR[e2]
+                    let nc8 = sc + straightC[e2]
+                    while (onBoard(nr8, nc8)) {
+                        let sq8 = squareFromRC(nr8, nc8)
+                        outMap[sq8] = true
+                        if (board[sq8] != EMPTY) { break }
+                        nr8 += straightR[e2]
+                        nc8 += straightC[e2]
+                    }
+                }
+            }
+        }
+    }
+}
+
+// Grows the pools lazily, one ply at a time, up to whatever ply the
+// search has actually reached -- NOT eagerly up to MAX_PLY all at once.
+// MAX_PLY is a worst-case safety cap (see the note above), but a typical
+// search never gets remotely close to it: a depth-3 self-play move only
+// ever touches a handful of ply levels. Eagerly building all MAX_PLY
+// levels' worth of pools up front, before a single move is even played,
+// turned out to be its own large allocation -- likely exactly why the
+// out-of-memory panic was happening immediately at game start rather
+// than partway through a search. Growing only as deep as actually used
+// means a shallow search pays for a shallow pool, not a worst-case one.
+function initPools (): void {
+    while (moveFromPool.length <= searchPly) {
+        moveFromPool.push([])
+        moveToPool.push([])
+        movePromotionPool.push([])
+        moveCastlePool.push([])
+        moveEPPool.push([])
+        boardPool.push([])
+        orderPool.push([])
+        tacticalValuePool.push([])
+        gainPool.push([])
+    }
+}
+
+// Scratch / working variables used throughout
+let r2 = 0
+let c2 = 0
+let w = 0
+let f = 0
+let _type = 0
+let piece = 0
+let piece2 = 0
+let captured = 0
+let _from = 0
+let to7 = 0
+let score = 0
+let p = 0
+let value = 0
+let sq = 0
+let q = 0
+let r = 0
+let a = 0
+let count = 0
+let legal = false
+// addMove()/generatePseudoMoves() write index -- see the comment on
+// addMove() below for why this replaces resetting the move-list pool
+// slots to empty (via a pop() loop) and rebuilding them from scratch with
+// push() on every single call.
+let pseudoMoveCount = 0
+let movingWhite = false
+let savedBoard: number[] = []
+let savedTurn = false
+let savedWCK = false
+let savedWCQ = false
+let savedBCK = false
+let savedBCQ = false
+let savedEP = 0
+let kingSquare = 0
+let whiteKing = 0
+let blackKing = 0
+
+// Own globals for generateLegalMoves' fast-path check below -- deliberately
+// NOT reusing `kingSquare` above, because that one gets overwritten by
+// every inCheck() call, including the ones testMoveLegal() below makes on
+// EVERY iteration of the loop that uses these. Sharing it would silently
+// clobber the outer king-square/in-check values partway through the loop.
+let legalGenKingSquare = 0
+let legalGenInCheck = false
+let wr = 0
+let wc = 0
+let br = 0
+let bc = 0
+let files = ""
+let file = ""
+let rank = ""
+let files2 = ""
+let file2 = 0
+let rank2 = 0
+let from2 = 0
+let to8 = 0
+let aiMove = 0
+let searchAborted = false
+let searchDeadline = 2147483647
+// Deepest ply that findBestMoveTimed() actually finished searching (not
+// just started) on its most recent call -- lets a caller show/report how
+// far the search actually got within its time budget, since two very
+// different depths can happen to agree on the same move (as depth 1 and
+// depth 2 do in at least one of the hand-picked test positions), which
+// otherwise makes "same move at two time budgets" impossible to tell
+// apart from "genuinely made no progress".
+let lastCompletedDepth = 0
+
+// Repetition-awareness inside the search tree. searchPathKeys starts
+// each root search as a copy of the REAL game's positionHistory, then
+// gets a new entry pushed/popped for every hypothetical move made
+// during the search (mirroring the board save/restore pattern used
+// everywhere else), so the search can tell when a line it's
+// considering would create a 3rd repetition. searchIrreversibleIndex
+// marks the earliest index still relevant to that count -- everything
+// before it happened before a capture/pawn push and so can never recur.
+let searchPathKeys: number[] = []
+let searchIrreversibleIndex = 0
+// How many centipawns a draw "costs" the side that's clearly ahead (and
+// "gains" the side that's clearly behind) when the search finds one by
+// repetition -- makes the engine mildly reluctant to shuffle into a draw
+// while winning, and mildly willing to seek one while losing.
+let contemptValue = 30
+
+// ------------------------------------------------------------
+// MOVE-ORDERING MEMORY (killer moves, history heuristic, root PV reuse)
+// ------------------------------------------------------------
+// Killer moves: two "slots" per remaining-depth level, remembering quiet
+// moves that caused a beta cutoff at that depth level in some OTHER branch
+// of the tree. A move that worked as a refutation once is a good first
+// guess elsewhere at the same depth, even in a totally different position,
+// because it's often a generally-dangerous square/piece combination (e.g.
+// a knight fork square) rather than something tied to the exact position.
+// Indexed by remaining search depth, capped at KILLER_SLOTS levels (deep
+// enough for the max depth findBestMoveTimed uses plus check extensions).
+let KILLER_SLOTS = 32
+let killerFrom1: number[] = []
+let killerTo1: number[] = []
+let killerFrom2: number[] = []
+let killerTo2: number[] = []
+
+// History heuristic: how often a quiet move has caused a beta cutoff
+// anywhere in the current search, weighted by how deep that cutoff was (a
+// cutoff found deep in the tree is a stronger signal than a shallow one).
+// Indexed by [moving piece type, to-square] rather than the classic
+// [from-square, to-square] -- 6*64 = 384 entries instead of 64*64 = 4096.
+// This loses a little precision (two different pawns going to the same
+// square share a slot) but is a well-known, perfectly reasonable variant
+// of the history heuristic, and on this device the 11x smaller table is
+// the difference between fitting in memory and not: even AFTER the
+// allocate-once fix below, hardware testing showed a 4096-entry table
+// alone was enough to exhaust the device's available RAM while it was
+// being built (confirmed by progress logging over serial: it consistently
+// died around index ~2300 of 4096, partway through, not instantly and not
+// right at the end -- the signature of genuinely running out of heap
+// during the array's growth, not a bug in the loop itself). Index formula:
+// (pieceType - 1) * 64 + toSquare, where pieceType is Math.abs(board value)
+// in 1..6 (PAWN..KING). Reset once per real move decision (each
+// findBestMoveTimed call) rather than kept across the whole game, so it
+// can't carry stale bias from a completely different position.
+let HISTORY_TABLE_SIZE = 384
+let historyTable: number[] = []
+
+// Root-move reuse across iterative deepening: the best move found by the
+// PREVIOUS (shallower) completed depth is tried first at the next depth,
+// since it's usually still a very strong candidate and a cheap, low-risk
+// stand-in for a full transposition table. Reset per move decision.
+let rootPVFrom = -1
+let rootPVTo = -1
+
+// Check extensions: search one extra ply (without spending depth budget)
+// when the side to move is in check, since check positions have few legal
+// replies and often hide forced tactics right at the search horizon. Capped
+// per search line so a long sequence of checks can't blow up the time
+// budget.
+let MAX_CHECK_EXTENSIONS = 4
+
+// Fills the killer/history/root-PV move-ordering memory with real,
+// explicit default values (rather than leaving the arrays empty and
+// relying on out-of-bounds reads quietly returning something sane -- that
+// works in a Node.js test harness but isn't something to rely on for the
+// real compiled-for-hardware target, and an uninitialized history slot
+// read as `undefined` would poison every ordering score it's added to).
+// Called once at the start of the game and again at the start of every
+// findBestMoveTimed call, so stale move-ordering hints from a completely
+// different position never carry over into the next real move decision.
+//
+// Rebuilding historyTable from an empty array via repeated pushes every
+// single call -- which is what this used to do -- means repeatedly growing
+// an array (many internal reallocate-and-copy steps along the way) and
+// discarding the old one as garbage, right at the start of every real move
+// and every new game. On a memory-tight device that is a large, sudden
+// allocation at exactly the moment a game starts -- a strong match for a
+// panic that happens right as the board is about to appear. Fixed the same
+// way as the pool buffers: allocate the HISTORY_TABLE_SIZE (and 32-ish
+// killer) slots ONCE, and every later call just resets their existing
+// contents in place. (This allocate-once fix alone was NOT enough while
+// the table was still 4096 entries -- see the comment on historyTable's
+// declaration above -- so the table was also shrunk to 384 entries.)
+let searchMemoryReady = false
+function resetSearchMemory (): void {
+    if (!searchMemoryReady) {
+        searchMemoryReady = true
+        for (let ki = 0; ki < KILLER_SLOTS; ki++) {
+            killerFrom1.push(-1)
+            killerTo1.push(-1)
+            killerFrom2.push(-1)
+            killerTo2.push(-1)
+        }
+        for (let hi = 0; hi < HISTORY_TABLE_SIZE; hi++) {
+            historyTable.push(0)
+        }
+    } else {
+        for (let ki = 0; ki < KILLER_SLOTS; ki++) {
+            killerFrom1[ki] = -1
+            killerTo1[ki] = -1
+            killerFrom2[ki] = -1
+            killerTo2[ki] = -1
+        }
+        for (let hi = 0; hi < HISTORY_TABLE_SIZE; hi++) {
+            historyTable[hi] = 0
+        }
+    }
+    rootPVFrom = -1
+    rootPVTo = -1
+}
+
+// "Thinking" animation on the 5x5 LED grid: fills in one more LED as time
+// runs out on the current move's budget, snaking through all 25 LEDs.
+let animationEnabled = false
+let searchStartTime = 0
+let searchBudgetMillis = 0
+let lastLedUpdateTime = 0
+let lastLedCount = 0
+let ledOrderX: number[] = [0, 1, 2, 3, 4, 4, 3, 2, 1, 0, 0, 1, 2, 3, 4, 4, 3, 2, 1, 0, 0, 1, 2, 3, 4]
+let ledOrderY: number[] = [0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 2, 2, 2, 2, 2, 3, 3, 3, 3, 3, 4, 4, 4, 4, 4]
+
+// DIAGNOSTIC: a plain count of every search()/quiesce() call made during the
+// current findBestMoveTimed() run, printed to the OLED every second so we
+// can watch it live on the device instead of only seeing before/after
+// state. This is what will tell us whether a timed search is genuinely
+// crunching through nodes very slowly, or stuck doing something else
+// entirely (in which case the counter will barely move at all).
+let debugNodeCount = 0
+let lastDebugUpdateTime = 0
+function updateDebugCounter (now: number): void {
+    if (now - lastDebugUpdateTime < 1000) {
+        return
+    }
+    lastDebugUpdateTime = now
+    kitronik_VIEW128x64.show("Nodes: " + debugNodeCount + " (" + Math.floor(now / 1000) + "s)", 6)
+}
+// These direction-offset tables are pure constants -- the same values
+// every single time -- but squareAttacked() and leastValuableAttacker()
+// used to rebuild them from a literal array every call. Both functions
+// run extremely often (every legality check, every check-detection call,
+// and up to 32 times per evaluate() call from the THREATS section), so
+// that was a large source of the allocation churn behind the "out of
+// memory" panic -- arguably a bigger one than the search's own move
+// lists. Building them once here and never reassigning them removes that
+// entirely.
+let knightR: number[] = [-2, -2, -1, -1, 1, 1, 2, 2]
+let knightC: number[] = [-1, 1, -2, 2, -2, 2, -1, 1]
+let nr = 0
+let nc = 0
+let p2 = 0
+let diagR: number[] = [-1, -1, 1, 1]
+let diagC: number[] = [-1, 1, -1, 1]
+let nr2 = 0
+let nc2 = 0
+let q2 = 0
+let straightR: number[] = [-1, 1, 0, 0]
+let straightC: number[] = [0, 0, -1, 1]
+let nr3 = 0
+let nc3 = 0
+let c = 0
+let kr: number[] = []
+let kc: number[] = []
+let nr6 = 0
+let nc6 = 0
+let to4 = 0
+let target2 = 0
+let nr7 = 0
+let nc7 = 0
+let to5 = 0
+let target3 = 0
+let nr5 = 0
+let to = 0
+let nr22 = 0
+let to2 = 0
+let bestIndex = 0
+
+PAWN = 1
+KNIGHT = 2
+BISHOP = 3
+ROOK = 4
+QUEEN = 5
+KING = 6
+
+// ------------------------------------------------------------
+// BOARD / SQUARE HELPERS
+// ------------------------------------------------------------
+function squareFromRC (r: number, c: number) {
+    return r * 8 + c
+}
+
+function row (square: number) {
+    return Math.idiv(square, 8)
+}
+
+function col (square: number) {
+    return square % 8
+}
+
+function onBoard (r: number, c: number) {
+    return r >= 0 && r < 8 && c >= 0 && c < 8
+}
+
+function isWhite (piece: number) {
+    return piece > 0
+}
+
+function isBlack (piece: number) {
+    return piece < 0
+}
+
+function squareName (square: number) {
+    files = "abcdefgh"
+    file = files.charAt(col(square))
+    rank = "" + (8 - row(square))
+    return "" + file + rank
+}
+
+function squareFromName (name: string) {
+    files2 = "abcdefgh"
+    file2 = files2.indexOf(name.charAt(0))
+    rank2 = parseInt(name.charAt(1))
+    if (file2 < 0 || rank2 < 1 || rank2 > 8) {
+        return -1
+    }
+    return (8 - rank2) * 8 + file2
+}
+
+function copyBoard () {
+    // Reuses this ply's preallocated slot instead of allocating a new
+    // 64-element array every time -- see the PER-PLY REUSABLE BUFFERS
+    // note near the top of the file. initPools() is cheap to call
+    // repeatedly (it no-ops after the first time) and guarantees the
+    // pools exist no matter which function gets called first.
+    initPools()
+    let result = boardPool[searchPly]
+    // Growing an array past its current length only via push() (never by
+    // assigning an out-of-range index, and never by setting .length --
+    // the real MakeCode compile target has no shim for that) is the only
+    // array-growth operation this project has confirmed works on-device.
+    // The first time a given ply's slot is used it's empty, so every
+    // write here goes through push(); every reuse after that it's
+    // already 64 long, so every write is a plain, safely in-bounds
+    // index assignment -- no further growth, no reallocation.
+    for (let o = 0; o <= 63; o++) {
+        if (o < result.length) {
+            result[o] = board[o]
+        } else {
+            result.push(board[o])
+        }
+    }
+    return result
+}
+
+// Restores `board` from a snapshot taken by copyBoard(), by copying its
+// contents back element-by-element instead of `board = saved` (a
+// reference reassignment). That distinction matters now that copyBoard()
+// hands out a reused pool slot rather than a fresh array: if restore just
+// repointed `board` at that same slot, `board` and the pool slot would
+// become the SAME object, so the very next copyBoard() at this ply would
+// silently snapshot nothing (copying the slot onto itself), and the move
+// made after it would corrupt the "saved" state instead of leaving it
+// intact to restore from. Copying contents back keeps `board` a single
+// stable array for the whole program, always genuinely independent of
+// whatever the pools are holding.
+function restoreBoard (saved: number[]): void {
+    for (let o = 0; o <= 63; o++) {
+        board[o] = saved[o]
+    }
+}
+
+function pieceValue (piece: number) {
+    a = Math.abs(piece)
+    if (a == PAWN) {
+        return 100
+    }
+    if (a == KNIGHT) {
+        return 320
+    }
+    if (a == BISHOP) {
+        return 330
+    }
+    if (a == ROOK) {
+        return 500
+    }
+    if (a == QUEEN) {
+        return 900
+    }
+    if (a == KING) {
+        return 20000
+    }
+    return 0
+}
+
+function findKing (white: boolean) {
+    let wanted = white ? KING : -KING
+    for (let l = 0; l <= 63; l++) {
+        if (board[l] == wanted) {
+            return l
+        }
+    }
+    return -1
+}
+
+// ------------------------------------------------------------
+// ATTACK DETECTION
+// ------------------------------------------------------------
+function squareAttacked (square: number, byWhite: boolean) {
+    r2 = row(square)
+    c2 = col(square)
+    // PAWNS
+    if (byWhite) {
+        if (onBoard(r2 + 1, c2 - 1)) {
+            if (board[squareFromRC(r2 + 1, c2 - 1)] == PAWN) {
+                return true
+            }
+        }
+        if (onBoard(r2 + 1, c2 + 1)) {
+            if (board[squareFromRC(r2 + 1, c2 + 1)] == PAWN) {
+                return true
+            }
+        }
+    } else {
+        if (onBoard(r2 - 1, c2 - 1)) {
+            if (board[squareFromRC(r2 - 1, c2 - 1)] == 0 - PAWN) {
+                return true
+            }
+        }
+        if (onBoard(r2 - 1, c2 + 1)) {
+            if (board[squareFromRC(r2 - 1, c2 + 1)] == 0 - PAWN) {
+                return true
+            }
+        }
+    }
+    // KNIGHTS
+    // knightR/knightC are filled once at the top of the file (constant
+    // values) -- no need to rebuild them here every call.
+    for (let m = 0; m <= 7; m++) {
+        nr = r2 + knightR[m]
+        nc = c2 + knightC[m]
+        if (onBoard(nr, nc)) {
+            p2 = board[squareFromRC(nr, nc)]
+            if (byWhite && p2 == KNIGHT) {
+                return true
+            }
+            if (!(byWhite) && p2 == 0 - KNIGHT) {
+                return true
+            }
+        }
+    }
+    // BISHOPS / QUEENS
+    // diagR/diagC are filled once at the top of the file -- constant.
+    for (let d = 0; d <= 3; d++) {
+        nr2 = r2 + diagR[d]
+        nc2 = c2 + diagC[d]
+        while (onBoard(nr2, nc2)) {
+            q2 = board[squareFromRC(nr2, nc2)]
+            if (q2 != EMPTY) {
+                if (byWhite && (q2 == BISHOP || q2 == QUEEN)) {
+                    return true
+                }
+                if (!(byWhite) && (q2 == 0 - BISHOP || q2 == 0 - QUEEN)) {
+                    return true
+                }
+                break;
+            }
+            nr2 += diagR[d]
+            nc2 += diagC[d]
+        }
+    }
+    // ROOKS / QUEENS
+    // straightR/straightC are filled once at the top of the file -- constant.
+    for (let e = 0; e <= 3; e++) {
+        nr3 = r2 + straightR[e]
+        nc3 = c2 + straightC[e]
+        while (onBoard(nr3, nc3)) {
+            c = board[squareFromRC(nr3, nc3)]
+            if (c != EMPTY) {
+                if (byWhite && (c == ROOK || c == QUEEN)) {
+                    return true
+                }
+                if (!(byWhite) && (c == 0 - ROOK || c == 0 - QUEEN)) {
+                    return true
+                }
+                break;
+            }
+            nr3 += straightR[e]
+            nc3 += straightC[e]
+        }
+    }
+    // KINGS
+    for (let dr = -1; dr <= 1; dr++) {
+        for (let dc = -1; dc <= 1; dc++) {
+            if (dr == 0 && dc == 0) {
+                continue
+            }
+            let nr4 = r2 + dr
+            let nc4 = c2 + dc
+            if (onBoard(nr4, nc4)) {
+                let t = board[squareFromRC(nr4, nc4)]
+                if (byWhite && t == KING) {
+                    return true
+                }
+                if (!byWhite && t == -KING) {
+                    return true
+                }
+            }
+        }
+    }
+    return false
+}
+
+// Returns the square of the LEAST valuable piece of `byWhite`'s color that
+// attacks `square` on the CURRENT `board`, or -1 if none does. Mirrors
+// squareAttacked's scan exactly (same piece-by-piece logic), but instead of
+// stopping at the first attacker found, it keeps the cheapest one -- used
+// by static exchange evaluation (SEE) below, which always wants to know
+// "what's the least valuable thing that could recapture here?"
+function leastValuableAttacker (square: number, byWhite: boolean) {
+    let bestFrom = -1
+    let bestValue = 999999
+    r2 = row(square)
+    c2 = col(square)
+    // Pawns
+    if (byWhite) {
+        if (onBoard(r2 + 1, c2 - 1) && board[squareFromRC(r2 + 1, c2 - 1)] == PAWN) {
+            bestFrom = squareFromRC(r2 + 1, c2 - 1); bestValue = pieceValue(PAWN)
+        }
+        if (onBoard(r2 + 1, c2 + 1) && board[squareFromRC(r2 + 1, c2 + 1)] == PAWN) {
+            if (pieceValue(PAWN) < bestValue) { bestFrom = squareFromRC(r2 + 1, c2 + 1); bestValue = pieceValue(PAWN) }
+        }
+    } else {
+        if (onBoard(r2 - 1, c2 - 1) && board[squareFromRC(r2 - 1, c2 - 1)] == 0 - PAWN) {
+            bestFrom = squareFromRC(r2 - 1, c2 - 1); bestValue = pieceValue(PAWN)
+        }
+        if (onBoard(r2 - 1, c2 + 1) && board[squareFromRC(r2 - 1, c2 + 1)] == 0 - PAWN) {
+            if (pieceValue(PAWN) < bestValue) { bestFrom = squareFromRC(r2 - 1, c2 + 1); bestValue = pieceValue(PAWN) }
+        }
+    }
+    // Knights
+    // knightR/knightC are filled once at the top of the file (constant
+    // values) -- no need to rebuild them here every call.
+    for (let m = 0; m <= 7; m++) {
+        nr = r2 + knightR[m]
+        nc = c2 + knightC[m]
+        if (onBoard(nr, nc)) {
+            p2 = board[squareFromRC(nr, nc)]
+            if (byWhite && p2 == KNIGHT) {
+                if (pieceValue(KNIGHT) < bestValue) { bestFrom = squareFromRC(nr, nc); bestValue = pieceValue(KNIGHT) }
+            }
+            if (!(byWhite) && p2 == 0 - KNIGHT) {
+                if (pieceValue(KNIGHT) < bestValue) { bestFrom = squareFromRC(nr, nc); bestValue = pieceValue(KNIGHT) }
+            }
+        }
+    }
+    // Bishops / queens
+    // diagR/diagC are filled once at the top of the file -- constant.
+    for (let d = 0; d <= 3; d++) {
+        nr2 = r2 + diagR[d]
+        nc2 = c2 + diagC[d]
+        while (onBoard(nr2, nc2)) {
+            q2 = board[squareFromRC(nr2, nc2)]
+            if (q2 != EMPTY) {
+                if (byWhite && q2 == BISHOP) {
+                    if (pieceValue(BISHOP) < bestValue) { bestFrom = squareFromRC(nr2, nc2); bestValue = pieceValue(BISHOP) }
+                } else if (!(byWhite) && q2 == 0 - BISHOP) {
+                    if (pieceValue(BISHOP) < bestValue) { bestFrom = squareFromRC(nr2, nc2); bestValue = pieceValue(BISHOP) }
+                } else if (byWhite && q2 == QUEEN) {
+                    if (pieceValue(QUEEN) < bestValue) { bestFrom = squareFromRC(nr2, nc2); bestValue = pieceValue(QUEEN) }
+                } else if (!(byWhite) && q2 == 0 - QUEEN) {
+                    if (pieceValue(QUEEN) < bestValue) { bestFrom = squareFromRC(nr2, nc2); bestValue = pieceValue(QUEEN) }
+                }
+                break;
+            }
+            nr2 += diagR[d]
+            nc2 += diagC[d]
+        }
+    }
+    // Rooks / queens
+    // straightR/straightC are filled once at the top of the file -- constant.
+    for (let e = 0; e <= 3; e++) {
+        nr3 = r2 + straightR[e]
+        nc3 = c2 + straightC[e]
+        while (onBoard(nr3, nc3)) {
+            c = board[squareFromRC(nr3, nc3)]
+            if (c != EMPTY) {
+                if (byWhite && c == ROOK) {
+                    if (pieceValue(ROOK) < bestValue) { bestFrom = squareFromRC(nr3, nc3); bestValue = pieceValue(ROOK) }
+                } else if (!(byWhite) && c == 0 - ROOK) {
+                    if (pieceValue(ROOK) < bestValue) { bestFrom = squareFromRC(nr3, nc3); bestValue = pieceValue(ROOK) }
+                } else if (byWhite && c == QUEEN) {
+                    if (pieceValue(QUEEN) < bestValue) { bestFrom = squareFromRC(nr3, nc3); bestValue = pieceValue(QUEEN) }
+                } else if (!(byWhite) && c == 0 - QUEEN) {
+                    if (pieceValue(QUEEN) < bestValue) { bestFrom = squareFromRC(nr3, nc3); bestValue = pieceValue(QUEEN) }
+                }
+                break;
+            }
+            nr3 += straightR[e]
+            nc3 += straightC[e]
+        }
+    }
+    // King
+    for (let dr = -1; dr <= 1; dr++) {
+        for (let dc = -1; dc <= 1; dc++) {
+            if (dr == 0 && dc == 0) {
+                continue
+            }
+            let nr4 = r2 + dr
+            let nc4 = c2 + dc
+            if (onBoard(nr4, nc4)) {
+                let t = board[squareFromRC(nr4, nc4)]
+                if (byWhite && t == KING) {
+                    if (pieceValue(KING) < bestValue) { bestFrom = squareFromRC(nr4, nc4); bestValue = pieceValue(KING) }
+                }
+                if (!byWhite && t == -KING) {
+                    if (pieceValue(KING) < bestValue) { bestFrom = squareFromRC(nr4, nc4); bestValue = pieceValue(KING) }
+                }
+            }
+        }
+    }
+    return bestFrom
+}
+
+// Static exchange evaluation: plays out the full sequence of captures and
+// recaptures on `toSq` -- starting with the move fromSq -> toSq -- on a
+// disposable scratch copy of the board, and returns the net material result
+// (in centipawns) for the side making that first capture. Positive means
+// the exchange wins material once all forced recaptures are accounted for;
+// negative means it loses material even though the first capture alone
+// looks tempting (e.g. a rook "winning" a pawn that's defended by another
+// pawn actually loses 400 once the rook gets recaptured).
+//
+// This temporarily points the global `board` at the scratch copy so it can
+// reuse leastValuableAttacker's scanning logic unchanged, then restores the
+// real board before returning -- the real board and search state are never
+// touched.
+function seeCaptureValue (fromSq: number, toSq: number) {
+    let realBoardSEE = board
+    board = copyBoard()
+
+    // Reuses this ply's preallocated slot (cleared with pop(), grown only
+    // with push() -- see PER-PLY REUSABLE BUFFERS) instead of a fresh
+    // array every call. This is called once per candidate capture during
+    // move ordering, so it can run several times per node.
+    initPools()
+    let gain = gainPool[searchPly]
+    while (gain.length > 0) { gain.pop() }
+    let d = 0
+    let sideToMove = isWhite(board[fromSq])
+    gain.push(pieceValue(board[toSq]))
+
+    let currentAttackerValue = pieceValue(board[fromSq])
+    board[toSq] = board[fromSq]
+    board[fromSq] = EMPTY
+    sideToMove = !sideToMove
+
+    while (true) {
+        let attackerFrom = leastValuableAttacker(toSq, sideToMove)
+        if (attackerFrom < 0) {
+            break
+        }
+        d = d + 1
+        gain.push(currentAttackerValue - gain[d - 1])
+        currentAttackerValue = pieceValue(board[attackerFrom])
+        board[toSq] = board[attackerFrom]
+        board[attackerFrom] = EMPTY
+        sideToMove = !sideToMove
+    }
+
+    while (d > 0) {
+        let optionA = 0 - gain[d - 1]
+        let optionB = gain[d]
+        let chosen = optionA > optionB ? optionA : optionB
+        gain[d - 1] = 0 - chosen
+        d = d - 1
+    }
+
+    board = realBoardSEE
+    return gain[0]
+}
+
+function inCheck (white: boolean) {
+    kingSquare = findKing(white)
+    if (kingSquare < 0) {
+        return true
+    }
+    return squareAttacked(kingSquare, !(white))
+}
+
+// ------------------------------------------------------------
+// MOVE GENERATION
+// ------------------------------------------------------------
+// Writes into this ply's pool slot at pseudoMoveCount if that slot already
+// exists (a plain, cheap in-bounds index assignment -- the slot is just
+// left over from an earlier, possibly-longer move list at this same ply,
+// and gets overwritten), and only push()es to actually grow the array
+// once pseudoMoveCount reaches its current length. Before this, every
+// call to generatePseudoMoves() first emptied its ply's arrays down to 0
+// (via the same kind of pop() loop copyBoard()'s own comment already
+// explains this file avoids for exactly this reason) and rebuilt the
+// entire ~35-move list with push() from scratch -- on every single node.
+// After a handful of nodes at a given ply, this pool slot has already
+// grown to roughly its high-water-mark move-count, so nearly every future
+// call becomes index writes only, with push() only for the rare node
+// that has YET MORE moves than any earlier node at this ply.
+function addMove (_from: number, to: number, promotion: number, castle: number, ep: boolean) {
+    if (pseudoMoveCount < movesFrom.length) {
+        movesFrom[pseudoMoveCount] = _from
+        movesTo[pseudoMoveCount] = to
+        movesPromotion[pseudoMoveCount] = promotion
+        movesCastle[pseudoMoveCount] = castle
+        movesEnPassant[pseudoMoveCount] = ep
+    } else {
+        movesFrom.push(_from)
+        movesTo.push(to)
+        movesPromotion.push(promotion)
+        movesCastle.push(castle)
+        movesEnPassant.push(ep)
+    }
+    pseudoMoveCount = pseudoMoveCount + 1
+}
+
+function generatePseudoMoves (white: boolean) {
+    // Reuse this ply's preallocated move-list slot instead of allocating
+    // five new arrays every call -- see PER-PLY REUSABLE BUFFERS above.
+    initPools()
+    movesFrom = moveFromPool[searchPly]
+    movesTo = moveToPool[searchPly]
+    movesPromotion = movePromotionPool[searchPly]
+    movesCastle = moveCastlePool[searchPly]
+    movesEnPassant = moveEPPool[searchPly]
+    // Deliberately NOT emptied here -- addMove() below overwrites these
+    // slots by index as it goes (see its own comment), so whatever this
+    // pool slot already holds from an earlier call at this ply is just
+    // stale data waiting to be overwritten or trimmed, not something that
+    // needs clearing first.
+    pseudoMoveCount = 0
+    for (let sq2 = 0; sq2 <= 63; sq2++) {
+        piece = board[sq2]
+        if (piece == EMPTY) {
+            continue;
+        }
+        if (white && piece < 0) {
+            continue;
+        }
+        if (!(white) && piece > 0) {
+            continue;
+        }
+        _type = Math.abs(piece)
+        w = row(sq2)
+        f = col(sq2)
+        if (_type == PAWN) {
+            let direction = white ? -1 : 1
+            let startRow = white ? 6 : 1
+            let promotionRow = white ? 0 : 7
+            nr5 = w + direction
+            if (onBoard(nr5, f)) {
+                to = squareFromRC(nr5, f)
+                if (board[to] == EMPTY) {
+                    if (nr5 == promotionRow) {
+                        addMove(sq2, to, 1, 0, false)
+                    } else {
+                        addMove(sq2, to, 0, 0, false)
+                    }
+                    if (w == startRow) {
+                        nr22 = w + direction * 2
+                        to2 = squareFromRC(nr22, f)
+                        if (board[to2] == EMPTY) {
+                            addMove(sq2, to2, 0, 0, false)
+                        }
+                    }
+                }
+            }
+            for (let dc2 = -1; dc2 <= 1; dc2 += 2) {
+                let nc5 = f + dc2
+                let nr23 = w + direction
+                if (!onBoard(nr23, nc5)) {
+                    continue
+                }
+                let to3 = squareFromRC(nr23, nc5)
+                let target = board[to3]
+                if (target != EMPTY) {
+                    if ((white && target < 0) || (!white && target > 0)) {
+                        if (nr23 == promotionRow) {
+                            addMove(sq2, to3, 1, 0, false)
+                        } else {
+                            addMove(sq2, to3, 0, 0, false)
+                        }
+                    }
+                }
+                if (to3 == enPassant) {
+                    addMove(sq2, to3, 0, 0, true)
+                }
+            }
+        } else if (_type == KNIGHT) {
+            // knightR/knightC are the shared constant table from the top
+            // of the file -- reused here instead of the old kr/kc pair
+            // that rebuilt the same 8 values as a fresh array every time
+            // a knight was found.
+            for (let n = 0; n <= 7; n++) {
+                nr6 = w + knightR[n]
+                nc6 = f + knightC[n]
+                if (!(onBoard(nr6, nc6))) {
+                    continue;
+                }
+                to4 = squareFromRC(nr6, nc6)
+                target2 = board[to4]
+                if (target2 == EMPTY || white && target2 < 0 || !(white) && target2 > 0) {
+                    addMove(sq2, to4, 0, 0, false)
+                }
+            }
+        } else if (_type == BISHOP || _type == ROOK || _type == QUEEN) {
+            // Slide along the diagonal directions (bishop/queen) and/or
+            // the straight directions (rook/queen) using the SAME shared
+            // diagR/diagC and straightR/straightC constant tables that
+            // squareAttacked() uses, instead of assembling a fresh
+            // combined direction array here every time a sliding piece
+            // was found.
+            if (_type == BISHOP || _type == QUEEN) {
+                for (let g = 0; g <= 3; g++) {
+                    nr7 = w + diagR[g]
+                    nc7 = f + diagC[g]
+                    while (onBoard(nr7, nc7)) {
+                        to5 = squareFromRC(nr7, nc7)
+                        target3 = board[to5]
+                        if (target3 == EMPTY) {
+                            addMove(sq2, to5, 0, 0, false)
+                        } else {
+                            if (white && target3 < 0 || !(white) && target3 > 0) {
+                                addMove(sq2, to5, 0, 0, false)
+                            }
+                            break;
+                        }
+                        nr7 += diagR[g]
+                        nc7 += diagC[g]
+                    }
+                }
+            }
+            if (_type == ROOK || _type == QUEEN) {
+                for (let g2 = 0; g2 <= 3; g2++) {
+                    nr7 = w + straightR[g2]
+                    nc7 = f + straightC[g2]
+                    while (onBoard(nr7, nc7)) {
+                        to5 = squareFromRC(nr7, nc7)
+                        target3 = board[to5]
+                        if (target3 == EMPTY) {
+                            addMove(sq2, to5, 0, 0, false)
+                        } else {
+                            if (white && target3 < 0 || !(white) && target3 > 0) {
+                                addMove(sq2, to5, 0, 0, false)
+                            }
+                            break;
+                        }
+                        nr7 += straightR[g2]
+                        nc7 += straightC[g2]
+                    }
+                }
+            }
+        } else if (_type == KING) {
+            for (let dr2 = -1; dr2 <= 1; dr2++) {
+                for (let dc3 = -1; dc3 <= 1; dc3++) {
+                    if (dr2 == 0 && dc3 == 0) {
+                        continue
+                    }
+                    let nr8 = w + dr2
+                    let nc8 = f + dc3
+                    if (!onBoard(nr8, nc8)) {
+                        continue
+                    }
+                    let to6 = squareFromRC(nr8, nc8)
+                    let target4 = board[to6]
+                    if (target4 == EMPTY ||
+                        (white && target4 < 0) ||
+                        (!white && target4 > 0)) {
+                        addMove(sq2, to6, 0, 0, false)
+                    }
+                }
+            }
+            // CASTLING
+            if (white && sq2 == 60 && !(inCheck(true))) {
+                if (whiteCastleKing && board[61] == EMPTY && board[62] == EMPTY && !(squareAttacked(61, false)) && !(squareAttacked(62, false))) {
+                    addMove(60, 62, 0, 1, false)
+                }
+                if (whiteCastleQueen && board[59] == EMPTY && board[58] == EMPTY && board[57] == EMPTY && !(squareAttacked(59, false)) && !(squareAttacked(58, false))) {
+                    addMove(60, 58, 0, 2, false)
+                }
+            }
+            if (!(white) && sq2 == 4 && !(inCheck(false))) {
+                if (blackCastleKing && board[5] == EMPTY && board[6] == EMPTY && !(squareAttacked(5, true)) && !(squareAttacked(6, true))) {
+                    addMove(4, 6, 0, 1, false)
+                }
+                if (blackCastleQueen && board[3] == EMPTY && board[2] == EMPTY && board[1] == EMPTY && !(squareAttacked(3, true)) && !(squareAttacked(2, true))) {
+                    addMove(4, 2, 0, 2, false)
+                }
+            }
+        }
+    }
+    // Trim any stale tail left over from an earlier, longer move list at
+    // this same ply -- addMove() only ever overwrote or grew, it never
+    // shrinks, so without this the arrays could still be longer than
+    // pseudoMoveCount actual moves.
+    while (movesFrom.length > pseudoMoveCount) { movesFrom.pop() }
+    while (movesTo.length > pseudoMoveCount) { movesTo.pop() }
+    while (movesPromotion.length > pseudoMoveCount) { movesPromotion.pop() }
+    while (movesCastle.length > pseudoMoveCount) { movesCastle.pop() }
+    while (movesEnPassant.length > pseudoMoveCount) { movesEnPassant.pop() }
+}
+
+function testMoveLegal (index: number) {
+    savedTurn = whiteToMove
+    savedWCK = whiteCastleKing
+    savedWCQ = whiteCastleQueen
+    savedBCK = blackCastleKing
+    savedBCQ = blackCastleQueen
+    savedEP = enPassant
+    movingWhite = whiteToMove
+    let savedWHC = whiteHasCastled
+    let savedBHC = blackHasCastled
+    // Captured before makeMove() so this doesn't rely on movesFrom/etc.
+    // still pointing at the same array afterward -- inCheck() below never
+    // touches them, but capturing up front costs nothing and matches the
+    // rule every other call site follows.
+    let uFromTML = movesFrom[index]
+    let uToTML = movesTo[index]
+    let uPromotionTML = movesPromotion[index]
+    let uCastleTML = movesCastle[index]
+    let uEPTML = movesEnPassant[index]
+    makeMove(index)
+    let savedCapturedTML = captured
+    legal = !(inCheck(movingWhite))
+    unmakeMove(uFromTML, uToTML, uPromotionTML, uCastleTML, uEPTML, savedCapturedTML)
+    whiteToMove = savedTurn
+    whiteCastleKing = savedWCK
+    whiteCastleQueen = savedWCQ
+    blackCastleKing = savedBCK
+    blackCastleQueen = savedBCQ
+    enPassant = savedEP
+    whiteHasCastled = savedWHC
+    blackHasCastled = savedBHC
+    return legal
+}
+
+function generateLegalMoves (white: boolean) {
+    // Filters the pseudo-legal list down to legal moves IN PLACE (compact
+    // survivors toward the front, then truncate) instead of building a
+    // second set of five new arrays -- testMoveLegal() only ever reads
+    // the single index it's given, never scans the rest of the list, so
+    // it's always safe to overwrite an earlier, already-processed slot.
+    generatePseudoMoves(white)
+    count = movesFrom.length
+
+    // FAST-PATH LEGALITY CHECK: testMoveLegal() is expensive -- a full
+    // board copy, make the move, scan the whole board for an attacker,
+    // then copy the board back -- and naively calling it for every single
+    // pseudo-legal move (~35 of them in a typical middlegame position) was
+    // by far the biggest cost per search node.
+    //
+    // The only way moving a piece can expose your own king to check is if
+    // that piece sits on the same rank, file or diagonal as your king AND
+    // there's an enemy slider aimed down that line (a "pin") -- so a piece
+    // that ISN'T on any of those three lines through the king can NEVER be
+    // pinned, and moving it is automatically legal whenever the king isn't
+    // currently in check. We don't even bother confirming there's really a
+    // pinning slider there; "shares a line with the king" is a safe (if
+    // slightly conservative) superset of "is pinned", so this can only
+    // ever skip the full test on moves that are genuinely always legal --
+    // it can never wrongly skip one that needed checking.
+    // King moves, en-passant captures, and anything while already in check
+    // still always go through the full, definitely-correct test below:
+    // king moves can walk into a new check the pin logic above doesn't
+    // cover, en-passant has its own rare discovered-check edge case along
+    // the rank, and while in check the legality of every move depends on
+    // whether it actually addresses that check, which this shortcut
+    // doesn't reason about at all.
+    legalGenKingSquare = findKing(white)
+    legalGenInCheck = legalGenKingSquare < 0 ? true : squareAttacked(legalGenKingSquare, !white)
+    let legalGenKingRow = legalGenKingSquare >= 0 ? row(legalGenKingSquare) : -1
+    let legalGenKingCol = legalGenKingSquare >= 0 ? col(legalGenKingSquare) : -1
+
+    let writeIdx = 0
+    for (let v = 0; v <= count - 1; v++) {
+        let needsFullTest = true
+        if (!legalGenInCheck && legalGenKingSquare >= 0 && movesFrom[v] != legalGenKingSquare && !movesEnPassant[v]) {
+            let fromRow = row(movesFrom[v])
+            let fromCol = col(movesFrom[v])
+            let sharesKingLine = (fromRow == legalGenKingRow) || (fromCol == legalGenKingCol) || (Math.abs(fromRow - legalGenKingRow) == Math.abs(fromCol - legalGenKingCol))
+            if (!sharesKingLine) {
+                needsFullTest = false
+            }
+        }
+        let moveIsLegal = needsFullTest ? testMoveLegal(v) : true
+        if (moveIsLegal) {
+            if (writeIdx != v) {
+                movesFrom[writeIdx] = movesFrom[v]
+                movesTo[writeIdx] = movesTo[v]
+                movesPromotion[writeIdx] = movesPromotion[v]
+                movesCastle[writeIdx] = movesCastle[v]
+                movesEnPassant[writeIdx] = movesEnPassant[v]
+            }
+            writeIdx = writeIdx + 1
+        }
+    }
+    // Same reasoning as generatePseudoMoves above: trim with pop() in a
+    // loop, never "arr.length = writeIdx" (unsupported on-device).
+    while (movesFrom.length > writeIdx) { movesFrom.pop() }
+    while (movesTo.length > writeIdx) { movesTo.pop() }
+    while (movesPromotion.length > writeIdx) { movesPromotion.pop() }
+    while (movesCastle.length > writeIdx) { movesCastle.pop() }
+    while (movesEnPassant.length > writeIdx) { movesEnPassant.pop() }
+}
+
+// ------------------------------------------------------------
+// MAKE MOVE
+// ------------------------------------------------------------
+function makeMove (index: number) {
+    _from = movesFrom[index]
+    to7 = movesTo[index]
+    piece2 = board[_from]
+    captured = board[to7]
+    // En-passant capture
+    if (movesEnPassant[index]) {
+        if (piece2 > 0) {
+            board[to7 + 8] = EMPTY
+        } else {
+            board[to7 - 8] = EMPTY
+        }
+    }
+    board[to7] = piece2
+    board[_from] = EMPTY
+    // Promotion
+    if (movesPromotion[index] != 0) {
+        if (piece2 > 0) {
+            board[to7] = QUEEN
+        } else {
+            board[to7] = 0 - QUEEN
+        }
+    }
+    // Castling: move rook
+    if (movesCastle[index] == 1) {
+        if (piece2 > 0) {
+            board[63] = EMPTY
+            board[61] = ROOK
+            whiteHasCastled = true
+        } else {
+            board[7] = EMPTY
+            board[5] = 0 - ROOK
+            blackHasCastled = true
+        }
+    } else if (movesCastle[index] == 2) {
+        if (piece2 > 0) {
+            board[56] = EMPTY
+            board[59] = ROOK
+            whiteHasCastled = true
+        } else {
+            board[0] = EMPTY
+            board[3] = 0 - ROOK
+            blackHasCastled = true
+        }
+    }
+    // Update castling rights
+    if (piece2 == KING) {
+        whiteCastleKing = false
+        whiteCastleQueen = false
+    }
+    if (piece2 == 0 - KING) {
+        blackCastleKing = false
+        blackCastleQueen = false
+    }
+    if (_from == 63 || to7 == 63) {
+        whiteCastleKing = false
+    }
+    if (_from == 56 || to7 == 56) {
+        whiteCastleQueen = false
+    }
+    if (_from == 7 || to7 == 7) {
+        blackCastleKing = false
+    }
+    if (_from == 0 || to7 == 0) {
+        blackCastleQueen = false
+    }
+    // New en-passant target
+    enPassant = -1
+    if (Math.abs(piece2) == PAWN) {
+        if (Math.abs(to7 - _from) == 16) {
+            enPassant = (to7 + _from) / 2
+        }
+    }
+    whiteToMove = !(whiteToMove)
+    return captured != EMPTY
+}
+
+// Reverses exactly what makeMove(index) did to the BOARD ARRAY ONLY --
+// putting back only the 2-4 squares that move actually touched, instead of
+// the old approach every call site used to use (copyBoard() a full 64-slot
+// snapshot before the move, restoreBoard() it back after). Every call site
+// already saves and restores whiteToMove/castling rights/en passant/
+// whiteHasCastled/blackHasCastled itself via plain local variables (that
+// was never the expensive part) -- this only replaces the board-copying
+// half of that pattern.
+//
+// `capturedPiece` has to be handed in by the caller: it's whatever the
+// makeMove() call's own `captured` GLOBAL held right after that call, and
+// since `captured` is a single shared global (like piece2/_from/to7
+// above), a caller MUST read it into a local variable immediately after
+// calling makeMove() and before making any further recursive call -- a
+// nested makeMove() from deeper in the search would otherwise silently
+// overwrite it before this unmake ever runs. This is exactly the same
+// "don't let a shared global survive across a recursive call" rule this
+// file already follows for every other piece of per-move state.
+// Takes the move's own details as plain parameters rather than an index
+// into movesFrom/movesTo/movesPromotion/movesCastle/movesEnPassant. Those
+// arrays are shared globals that a nested recursive call (which runs
+// generateLegalMoves() and reassigns them to a DIFFERENT ply's arrays) is
+// guaranteed to have repointed by the time control gets back here to undo
+// this move -- reading `movesFrom[index]` etc. at this point would silently
+// read the wrong ply's move list. So the caller captures everything this
+// needs into its own local variables right after calling makeMove(index),
+// before any recursive call has a chance to touch those globals, exactly
+// the same discipline already used for `captured`.
+function unmakeMove (uFrom: number, uTo: number, uPromotion: number, uCastle: number, uEnPassant: boolean, capturedPiece: number): void {
+    let movedPiece = board[uTo]
+    if (uPromotion != 0) {
+        // Whatever is sitting on the destination square right now is the
+        // promoted piece (always a queen, per addMove's promotion flag) --
+        // the piece that actually left `from` was a pawn of the same color.
+        movedPiece = movedPiece > 0 ? PAWN : 0 - PAWN
+    }
+    board[uFrom] = movedPiece
+    board[uTo] = capturedPiece
+    if (uEnPassant) {
+        // The captured pawn was never actually ON the `to` square (that's
+        // why en passant needs its own case) -- makeMove() put EMPTY there
+        // and removed the real captured pawn from the square behind it.
+        board[uTo] = EMPTY
+        if (movedPiece > 0) {
+            board[uTo + 8] = 0 - PAWN
+        } else {
+            board[uTo - 8] = PAWN
+        }
+    }
+    if (uCastle == 1) {
+        if (movedPiece > 0) {
+            board[61] = EMPTY
+            board[63] = ROOK
+        } else {
+            board[5] = EMPTY
+            board[7] = 0 - ROOK
+        }
+    } else if (uCastle == 2) {
+        if (movedPiece > 0) {
+            board[59] = EMPTY
+            board[56] = ROOK
+        } else {
+            board[3] = EMPTY
+            board[0] = 0 - ROOK
+        }
+    }
+}
+
+// ------------------------------------------------------------
+// PIECE-SQUARE TABLES
+// Standard "simplified evaluation function" tables (values in
+// centipawns). Index 0 = a8 ... index 63 = h1, same convention
+// as the board array, so a White piece's table value can be
+// looked up directly by its square index. For a Black piece,
+// the table is looked up mirrored top-to-bottom (its good
+// squares are the mirror image of White's) and the result is
+// then negated before adding to the score, since positive score
+// always means "good for White" throughout evaluate().
+// ------------------------------------------------------------
+let PST_PAWN: number[] = [
+    0, 0, 0, 0, 0, 0, 0, 0,
+    50, 50, 50, 50, 50, 50, 50, 50,
+    10, 10, 20, 30, 30, 20, 10, 10,
+    5, 5, 10, 25, 25, 10, 5, 5,
+    0, 0, 0, 20, 20, 0, 0, 0,
+    5, -5, -10, 0, 0, -10, -5, 5,
+    5, 10, 10, -20, -20, 10, 10, 5,
+    0, 0, 0, 0, 0, 0, 0, 0
+]
+let PST_KNIGHT: number[] = [
+    -50, -40, -30, -30, -30, -30, -40, -50,
+    -40, -20, 0, 0, 0, 0, -20, -40,
+    -30, 0, 10, 15, 15, 10, 0, -30,
+    -30, 5, 15, 20, 20, 15, 5, -30,
+    -30, 0, 15, 20, 20, 15, 0, -30,
+    -30, 5, 10, 15, 15, 10, 5, -30,
+    -40, -20, 0, 5, 5, 0, -20, -40,
+    -50, -40, -30, -30, -30, -30, -40, -50
+]
+let PST_BISHOP: number[] = [
+    -20, -10, -10, -10, -10, -10, -10, -20,
+    -10, 0, 0, 0, 0, 0, 0, -10,
+    -10, 0, 5, 10, 10, 5, 0, -10,
+    -10, 5, 5, 10, 10, 5, 5, -10,
+    -10, 0, 10, 10, 10, 10, 0, -10,
+    -10, 10, 10, 10, 10, 10, 10, -10,
+    -10, 5, 0, 0, 0, 0, 5, -10,
+    -20, -10, -10, -10, -10, -10, -10, -20
+]
+let PST_ROOK: number[] = [
+    0, 0, 0, 0, 0, 0, 0, 0,
+    5, 10, 10, 10, 10, 10, 10, 5,
+    -5, 0, 0, 0, 0, 0, 0, -5,
+    -5, 0, 0, 0, 0, 0, 0, -5,
+    -5, 0, 0, 0, 0, 0, 0, -5,
+    -5, 0, 0, 0, 0, 0, 0, -5,
+    -5, 0, 0, 0, 0, 0, 0, -5,
+    0, 0, 0, 5, 5, 0, 0, 0
+]
+let PST_QUEEN: number[] = [
+    -20, -10, -10, -5, -5, -10, -10, -20,
+    -10, 0, 0, 0, 0, 0, 0, -10,
+    -10, 0, 5, 5, 5, 5, 0, -10,
+    -5, 0, 5, 5, 5, 5, 0, -5,
+    0, 0, 5, 5, 5, 5, 0, -5,
+    -10, 5, 5, 5, 5, 5, 0, -10,
+    -10, 0, 5, 0, 0, 0, 0, -10,
+    -20, -10, -10, -5, -5, -10, -10, -20
+]
+let PST_KING_MID: number[] = [
+    -30, -40, -40, -50, -50, -40, -40, -30,
+    -30, -40, -40, -50, -50, -40, -40, -30,
+    -30, -40, -40, -50, -50, -40, -40, -30,
+    -30, -40, -40, -50, -50, -40, -40, -30,
+    -20, -30, -30, -40, -40, -30, -30, -20,
+    -10, -20, -20, -20, -20, -20, -20, -10,
+    20, 20, 0, 0, 0, 0, 20, 20,
+    20, 30, 10, 0, 0, 10, 30, 20
+]
+let PST_KING_END: number[] = [
+    -50, -40, -30, -20, -20, -30, -40, -50,
+    -30, -20, -10, 0, 0, -10, -20, -30,
+    -30, -10, 20, 30, 30, 20, -10, -30,
+    -30, -10, 30, 40, 40, 30, -10, -30,
+    -30, -10, 30, 40, 40, 30, -10, -30,
+    -30, -10, 20, 30, 30, 20, -10, -30,
+    -30, -30, 0, 0, 0, 0, -30, -30,
+    -50, -30, -30, -30, -30, -30, -30, -50
+]
+
+// Looks up a piece-square table value for a piece on square `sq`.
+// White pieces read the table directly; Black pieces read it
+// mirrored top-to-bottom (their promotion rank is rank 1's mirror
+// of White's rank 8, etc).
+function pstLookup (table: number[], sq: number, white: boolean): number {
+    if (white) {
+        return table[sq]
+    } else {
+        let mirrored = squareFromRC(7 - row(sq), col(sq))
+        return table[mirrored]
+    }
+}
+
+// A pawn is "passed" if no enemy pawn can ever stop or capture it on its
+// way to promotion -- that is, no enemy pawn sits on its own file or
+// either adjacent file, anywhere between it and the promotion rank.
+function isPassedPawn (sq: number, white: boolean) {
+    let pr = row(sq)
+    let pc = col(sq)
+    for (let cf = pc - 1; cf <= pc + 1; cf++) {
+        if (cf < 0 || cf > 7) {
+            continue;
+        }
+        if (white) {
+            for (let rr = 0; rr < pr; rr++) {
+                if (board[squareFromRC(rr, cf)] == 0 - PAWN) {
+                    return false
+                }
+            }
+        } else {
+            for (let rr = pr + 1; rr <= 7; rr++) {
+                if (board[squareFromRC(rr, cf)] == PAWN) {
+                    return false
+                }
+            }
+        }
+    }
+    return true
+}
+
+// ------------------------------------------------------------
+// EVALUATION
+// ------------------------------------------------------------
+function evaluate () {
+    score = 0
+    // 1. MATERIAL
+    for (let i = 0; i <= 63; i++) {
+        p = board[i]
+        if (p == EMPTY) {
+            continue;
+        }
+        value = pieceValue(p)
+        if (isWhite(p)) {
+            score += value
+        } else {
+            score += 0 - value
+        }
+    }
+    // 2. PIECE-SQUARE TABLES -- per-piece-type positional bonuses
+    //    (centre control, development and king safety all fall out of
+    //    these automatically, more precisely than ad-hoc bonuses did).
+    //    The king table switches to an endgame version once there isn't
+    //    much material left on the board.
+    let nonPawnMaterial = 0
+    for (let ii = 0; ii <= 63; ii++) {
+        let ppNP = board[ii]
+        if (ppNP == EMPTY) {
+            continue;
+        }
+        let atNP = Math.abs(ppNP)
+        if (atNP != PAWN && atNP != KING) {
+            nonPawnMaterial += pieceValue(ppNP)
+        }
+    }
+    let isEndgame = nonPawnMaterial <= 1300
+
+    for (let i3 = 0; i3 <= 63; i3++) {
+        let pc = board[i3]
+        if (pc == EMPTY) {
+            continue;
+        }
+        let whiteSide = pc > 0
+        let atype = Math.abs(pc)
+        let pstVal = 0
+        if (atype == PAWN) {
+            pstVal = pstLookup(PST_PAWN, i3, whiteSide)
+        } else if (atype == KNIGHT) {
+            pstVal = pstLookup(PST_KNIGHT, i3, whiteSide)
+        } else if (atype == BISHOP) {
+            pstVal = pstLookup(PST_BISHOP, i3, whiteSide)
+        } else if (atype == ROOK) {
+            pstVal = pstLookup(PST_ROOK, i3, whiteSide)
+        } else if (atype == QUEEN) {
+            pstVal = pstLookup(PST_QUEEN, i3, whiteSide)
+        } else if (atype == KING) {
+            if (isEndgame) {
+                pstVal = pstLookup(PST_KING_END, i3, whiteSide)
+            } else {
+                pstVal = pstLookup(PST_KING_MID, i3, whiteSide)
+            }
+        }
+        if (whiteSide) {
+            score += pstVal
+        } else {
+            score += 0 - pstVal
+        }
+    }
+    // 3. THREATS -- being attacked is bad for the piece's own side,
+    //    threatening an enemy piece is good for the attacker
+    //
+    //    This used to call squareAttacked(k, ...) fresh for every one of
+    //    the up to ~30 occupied squares -- each call its own full scan
+    //    outward from that square. buildAttackMap() computes the exact
+    //    same true/false answers for all 64 squares at once, in one pass
+    //    over the board's pieces, so this loop is now just two O(1) array
+    //    lookups per piece instead of two full board scans.
+    buildAttackMap(false, attackMapBlack)
+    buildAttackMap(true, attackMapWhite)
+    for (let k = 0; k <= 63; k++) {
+        r = board[k]
+        if (r == EMPTY) {
+            continue;
+        }
+        // White piece -- being attacked by Black is BAD for White
+        if (r > 0) {
+            if (attackMapBlack[k]) {
+                score += 0 - 5
+                if (r == QUEEN) {
+                    score += 0 - 20
+                } else if (r == ROOK) {
+                    score += 0 - 12
+                } else if (r == BISHOP || r == KNIGHT) {
+                    score += 0 - 8
+                }
+            }
+        }
+        // Black piece -- being attacked by White is GOOD for White
+        if (r < 0) {
+            if (attackMapWhite[k]) {
+                score += 5
+                if (r == 0 - QUEEN) {
+                    score += 20
+                } else if (r == 0 - ROOK) {
+                    score += 12
+                } else if (r == 0 - BISHOP || r == 0 - KNIGHT) {
+                    score += 8
+                }
+            }
+        }
+    }
+    // 4. CASTLING -- reward ACTUALLY castling; mildly penalize losing
+    //    castling rights without having castled (a manual king/rook move)
+    if (!(whiteCastleKing) && !(whiteCastleQueen)) {
+        if (whiteHasCastled) {
+            score += 40
+        } else {
+            score += 0 - 15
+        }
+    }
+    if (!(blackCastleKing) && !(blackCastleQueen)) {
+        if (blackHasCastled) {
+            score += 0 - 40
+        } else {
+            score += 15
+        }
+    }
+
+    // 5. PAWN STRUCTURE, BISHOP PAIR, ROOK/KING FILE SAFETY
+    //    One pass builds per-file pawn counts for both sides; doubled,
+    //    isolated and the rook/king open-file checks below all reuse it
+    //    (an "open" file has no pawns of either color; a "semi-open" file
+    //    has none of the side being checked, but the other side still has
+    //    one there).
+    // whitePawnsOnFile/blackPawnsOnFile and passedBonusByDistance are
+    // shared globals declared near the top of the file now, reset (not
+    // reallocated) below -- see the note there.
+    for (let pfc = 0; pfc <= 7; pfc++) {
+        whitePawnsOnFile[pfc] = 0
+        blackPawnsOnFile[pfc] = 0
+    }
+    for (let pf = 0; pf <= 63; pf++) {
+        let pcf = board[pf]
+        if (pcf == PAWN) {
+            whitePawnsOnFile[col(pf)] = whitePawnsOnFile[col(pf)] + 1
+        } else if (pcf == 0 - PAWN) {
+            blackPawnsOnFile[col(pf)] = blackPawnsOnFile[col(pf)] + 1
+        }
+    }
+
+    let whiteBishops = 0
+    let blackBishops = 0
+
+    for (let pf2 = 0; pf2 <= 63; pf2++) {
+        let pcf2 = board[pf2]
+        if (pcf2 == EMPTY) {
+            continue;
+        }
+        let fcol = col(pf2)
+
+        if (pcf2 == BISHOP) { whiteBishops = whiteBishops + 1 }
+        if (pcf2 == 0 - BISHOP) { blackBishops = blackBishops + 1 }
+
+        if (pcf2 == PAWN) {
+            if (whitePawnsOnFile[fcol] > 1) { score += 0 - 12 }
+            let hasNeighborW = false
+            if (fcol > 0 && whitePawnsOnFile[fcol - 1] > 0) { hasNeighborW = true }
+            if (fcol < 7 && whitePawnsOnFile[fcol + 1] > 0) { hasNeighborW = true }
+            if (!hasNeighborW) { score += 0 - 14 }
+            if (isPassedPawn(pf2, true)) {
+                let distW = row(pf2)
+                score += passedBonusByDistance[distW]
+            }
+        } else if (pcf2 == 0 - PAWN) {
+            if (blackPawnsOnFile[fcol] > 1) { score += 12 }
+            let hasNeighborB = false
+            if (fcol > 0 && blackPawnsOnFile[fcol - 1] > 0) { hasNeighborB = true }
+            if (fcol < 7 && blackPawnsOnFile[fcol + 1] > 0) { hasNeighborB = true }
+            if (!hasNeighborB) { score += 14 }
+            if (isPassedPawn(pf2, false)) {
+                let distB = 7 - row(pf2)
+                score += 0 - passedBonusByDistance[distB]
+            }
+        } else if (pcf2 == ROOK) {
+            if (whitePawnsOnFile[fcol] == 0) {
+                score += blackPawnsOnFile[fcol] == 0 ? 15 : 8
+            }
+        } else if (pcf2 == 0 - ROOK) {
+            if (blackPawnsOnFile[fcol] == 0) {
+                score += whitePawnsOnFile[fcol] == 0 ? -15 : -8
+            }
+        } else if (pcf2 == KING) {
+            if (whitePawnsOnFile[fcol] == 0) {
+                score += blackPawnsOnFile[fcol] == 0 ? -25 : -12
+            }
+        } else if (pcf2 == 0 - KING) {
+            if (blackPawnsOnFile[fcol] == 0) {
+                score += whitePawnsOnFile[fcol] == 0 ? 25 : 12
+            }
+        }
+    }
+    if (whiteBishops >= 2) { score += 30 }
+    if (blackBishops >= 2) { score += 0 - 30 }
+
+    return score
+}
+
+// ------------------------------------------------------------
+// MOVE ORDERING
+// ------------------------------------------------------------
+function orderMoveIndices (depthRemaining: number, useRootPV: boolean): number[] {
+    // Reuses this ply's preallocated slot instead of allocating two new
+    // arrays every node -- same PER-PLY REUSABLE BUFFERS pattern as move
+    // generation and board copies. This runs once per search/quiesce
+    // node (not once per move tried), but that's still every node in the
+    // whole tree, so it mattered just as much as the move lists did.
+    initPools()
+    let order = orderPool[searchPly]
+    let tacticalValue = tacticalValuePool[searchPly]
+    while (order.length > 0) { order.pop() }
+    while (tacticalValue.length > 0) { tacticalValue.pop() }
+    for (let i = 0; i <= movesFrom.length - 1; i++) {
+        order.push(i)
+        let v = 0
+        let targetPiece = board[movesTo[i]]
+        let isCaptureMove = targetPiece != EMPTY
+        if (isCaptureMove) {
+            // Order captures by their STATIC EXCHANGE EVALUATION (the net
+            // material result once every forced recapture on that square
+            // is played out), not just the victim's raw value -- a queen
+            // "winning" a pawn that's defended by another pawn is actually
+            // a bad trade once the recapture happens, and SEE knows that
+            // where plain MVV-LVA didn't.
+            let seeVal = seeCaptureValue(movesFrom[i], movesTo[i])
+            v = v + 20000 + seeVal
+        }
+        if (movesPromotion[i] != 0) {
+            v = v + 800
+        }
+        if (!isCaptureMove && movesPromotion[i] == 0) {
+            // Quiet move: killer moves (refutations found elsewhere at this
+            // same depth) first, then the history heuristic (how often this
+            // exact [from,to] move has caused a cutoff anywhere so far).
+            if (depthRemaining >= 0 && depthRemaining < KILLER_SLOTS) {
+                if (movesFrom[i] == killerFrom1[depthRemaining] && movesTo[i] == killerTo1[depthRemaining]) {
+                    v = v + 6000
+                } else if (movesFrom[i] == killerFrom2[depthRemaining] && movesTo[i] == killerTo2[depthRemaining]) {
+                    v = v + 5000
+                }
+            }
+            let histPieceType = Math.abs(board[movesFrom[i]])
+            let histVal = historyTable[(histPieceType - 1) * 64 + movesTo[i]]
+            if (histVal > 4000) { histVal = 4000 }
+            v = v + histVal
+        }
+        if (useRootPV) {
+            if (movesFrom[i] == rootPVFrom && movesTo[i] == rootPVTo) {
+                v = v + 1000000
+            }
+        }
+        tacticalValue.push(v)
+    }
+    for (let x = 1; x <= order.length - 1; x++) {
+        let keyOrder = order[x]
+        let keyVal = tacticalValue[x]
+        let y = x - 1
+        while (y >= 0 && tacticalValue[y] < keyVal) {
+            order[y + 1] = order[y]
+            tacticalValue[y + 1] = tacticalValue[y]
+            y = y - 1
+        }
+        order[y + 1] = keyOrder
+        tacticalValue[y + 1] = keyVal
+    }
+    return order
+}
+
+// DIAGNOSTIC TOGGLE: the "thinking" LED animation (updateThinkingAnimation,
+// below) is the ONE thing that runs during a timed search and never runs
+// during a fixed-ply search -- so it's the prime suspect for why timed
+// searches have been reaching much shallower depths than a fixed-ply search
+// of the same position does in the same rough amount of time. Flip this to
+// false, reflash, and re-run the same timed test: if the depth reached
+// jumps back up to what the node-count math predicts, this confirms the
+// animation (or something in the display calls it makes) is the bottleneck,
+// and we can look at making it cheaper rather than guessing further.
+let ENABLE_THINKING_ANIMATION = true
+
+// ------------------------------------------------------------
+// QUIESCENCE SEARCH
+// ------------------------------------------------------------
+
+function quiesce (alpha: number, beta: number): number {
+    let nowT = input.runningTime()
+    if (animationEnabled) {
+        debugNodeCount = debugNodeCount + 1
+        updateDebugCounter(nowT)
+    }
+    if (nowT > searchDeadline) {
+        searchAborted = true
+        return 0
+    }
+    if (animationEnabled && ENABLE_THINKING_ANIMATION) {
+        updateThinkingAnimation(nowT)
+    }
+    let standPat = evaluate()
+    let maximizing = whiteToMove
+    if (maximizing) {
+        if (standPat >= beta) { return beta }
+        if (standPat > alpha) { alpha = standPat }
+    } else {
+        if (standPat <= alpha) { return alpha }
+        if (standPat < beta) { beta = standPat }
+    }
+
+    generateLegalMoves(whiteToMove)
+    if (movesFrom.length == 0) {
+        // Same reuse as in search() -- generateLegalMoves() already worked
+        // this out.
+        if (legalGenInCheck) {
+            return maximizing ? -29000 : 29000
+        }
+        return 0
+    }
+
+    let localFrom = movesFrom
+    let localTo = movesTo
+    let localPromotion = movesPromotion
+    let localCastle = movesCastle
+    let localEP = movesEnPassant
+    let order = orderMoveIndices(-1, false)
+    // orderMoveIndices() already ran seeCaptureValue() on every capture here
+    // to sort them -- this pool slot (captured now, same per-ply-reuse
+    // reasoning as localFrom/etc. above) still holds each move's ordering
+    // score at the matching index into `order`, so SEE pruning below can
+    // read the SEE value back out of it instead of paying for a second,
+    // redundant seeCaptureValue() call on every capture tried.
+    let localTacticalValue = tacticalValuePool[searchPly]
+
+    for (let k = 0; k <= order.length - 1; k++) {
+        let idx = order[k]
+        let isCaptureMove = board[localTo[idx]] != EMPTY
+        let isTactical = isCaptureMove || (localPromotion[idx] != 0)
+        if (!isTactical) { break }
+
+        // SEE PRUNING: skip a capture that loses material even after every
+        // forced recapture plays out -- quiescence exists to resolve
+        // tactics, and a capture that comes out behind on the exchange
+        // isn't one. Captures are tried in SEE order, best first (see
+        // orderMoveIndices), so a losing one here doesn't mean a later,
+        // better capture gets skipped too -- only `continue`s past this
+        // one loser, rather than `break`ing the whole loop, since a
+        // non-capturing promotion (no exchange to evaluate, so not
+        // SEE-pruned) can still be waiting later in this same list.
+        // seeVal recovered from orderMoveIndices()'s own scoring formula
+        // (v = 20000 + seeVal, plus 800 more if this capture is also a
+        // promotion) rather than recomputed from scratch.
+        if (isCaptureMove) {
+            let seeVal = localTacticalValue[k] - 20000 - (localPromotion[idx] != 0 ? 800 : 0)
+            if (seeVal < 0) { continue }
+        }
+
+        movesFrom = localFrom; movesTo = localTo; movesPromotion = localPromotion
+        movesCastle = localCastle; movesEnPassant = localEP
+
+        let sTurn = whiteToMove
+        let sWCK = whiteCastleKing
+        let sWCQ = whiteCastleQueen
+        let sBCK = blackCastleKing
+        let sBCQ = blackCastleQueen
+        let sEP = enPassant
+        let sWHC = whiteHasCastled
+        let sBHC = blackHasCastled
+
+        makeMove(idx)
+        let sCaptured = captured
+        let s = 0
+        if (searchPly + 1 >= MAX_PLY) {
+            // Safety net against a pathological, unrealistically long
+            // forced-capture chain running past the pool size -- just
+            // stop extending and settle for the static eval here.
+            s = evaluate()
+        } else {
+            searchPly = searchPly + 1
+            s = quiesce(alpha, beta)
+            searchPly = searchPly - 1
+        }
+
+        // localFrom/localTo/etc. (captured before this loop started) are
+        // used here instead of movesFrom[idx]/movesTo[idx] -- the recursive
+        // quiesce() call just above reassigned those globals to a deeper
+        // ply's arrays, so reading them now would read the wrong move.
+        unmakeMove(localFrom[idx], localTo[idx], localPromotion[idx], localCastle[idx], localEP[idx], sCaptured); whiteToMove = sTurn
+        whiteCastleKing = sWCK; whiteCastleQueen = sWCQ
+        blackCastleKing = sBCK; blackCastleQueen = sBCQ
+        enPassant = sEP
+        whiteHasCastled = sWHC
+        blackHasCastled = sBHC
+
+        if (searchAborted) { break }
+
+        if (maximizing) {
+            if (s > alpha) { alpha = s }
+        } else {
+            if (s < beta) { beta = s }
+        }
+        if (alpha >= beta) { break }
+    }
+    return maximizing ? alpha : beta
+}
+
+// Lights up more of the 5x5 LED grid as the current move's time budget
+// runs out (25 LEDs total, filled in a snaking order). Only does anything
+// while animationEnabled is true (set by findBestMoveTimed), and is
+// throttled to update at most every 200ms so it doesn't slow the search.
+function updateThinkingAnimation (now: number): void {
+    if (now - lastLedUpdateTime < 200) {
+        return
+    }
+    lastLedUpdateTime = now
+    let fraction = 1
+    if (searchBudgetMillis > 0) {
+        fraction = (now - searchStartTime) / searchBudgetMillis
+    }
+    if (fraction < 0) { fraction = 0 }
+    if (fraction > 1) { fraction = 1 }
+    let count = Math.floor(fraction * 25)
+    if (count < 1) { count = 1 }
+    if (count > 25) { count = 25 }
+    if (count == lastLedCount) {
+        return
+    }
+    lastLedCount = count
+    basic.clearScreen()
+    for (let i = 0; i <= count - 1; i++) {
+        led.plot(ledOrderX[i], ledOrderY[i])
+    }
+}
+
+// ------------------------------------------------------------
+// SEARCH (alpha-beta with move ordering, quiescence at horizon)
+// ------------------------------------------------------------
+// NOTE: an earlier version of this function had null-move pruning added
+// here. It was removed after testing found it caused real blunders (e.g.
+// missing a simple free-pawn capture in the opening) -- raising its
+// minimum-depth guard only pushed the same failure one ply deeper rather
+// than fixing it, so rather than ship something that plays worse in
+// ordinary positions, it was taken back out. Everything else from that
+// round of changes (piece-square tables, MVV-LVA move ordering, the
+// instant single-legal-move path) tested correctly and stayed.
+function search (depth: number, alpha: number, beta: number, extCount: number): number {
+    let nowT = input.runningTime()
+    if (animationEnabled) {
+        debugNodeCount = debugNodeCount + 1
+        updateDebugCounter(nowT)
+    }
+    if (nowT > searchDeadline) {
+        searchAborted = true
+        return 0
+    }
+    if (animationEnabled && ENABLE_THINKING_ANIMATION) {
+        updateThinkingAnimation(nowT)
+    }
+    generateLegalMoves(whiteToMove)
+    // generateLegalMoves() just computed exactly this (as legalGenInCheck)
+    // while it was already scanning for the king anyway -- no need to pay
+    // for a second full findKing()+squareAttacked() scan to ask the same
+    // question again.
+    let nodeInCheck = legalGenInCheck
+    if (movesFrom.length == 0) {
+        if (nodeInCheck) {
+            if (whiteToMove) { return -30000 - depth }
+            else { return 30000 + depth }
+        } else { return 0 }
+    }
+
+    // CHECK EXTENSION: being in check right now means there are few legal
+    // replies and a forced tactic could be just past the horizon, so give
+    // this node an extra ply "for free" (without spending the normal depth
+    // budget) rather than risk cutting the line off mid-check. Capped by
+    // MAX_CHECK_EXTENSIONS per line so a long sequence of checks can't blow
+    // up the time budget.
+    let effectiveDepth = depth
+    let nextExtCount = extCount
+    if (nodeInCheck && extCount < MAX_CHECK_EXTENSIONS) {
+        effectiveDepth = depth + 1
+        nextExtCount = extCount + 1
+    }
+
+    // THREEFOLD REPETITION (within the search tree): if the position we
+    // just arrived at has now happened 3 times (counting the real game's
+    // history plus hypothetical moves made so far along this search
+    // line), it's a forced draw -- no need to search deeper here. Apply
+    // a small contempt adjustment so the engine is mildly reluctant to
+    // walk into this when it's clearly ahead, and mildly willing to when
+    // it's clearly behind (a draw is a good result if you're losing).
+    if (searchPathKeys.length > 0) {
+        let curKey = searchPathKeys[searchPathKeys.length - 1]
+        let repCount = 0
+        for (let z4 = searchIrreversibleIndex; z4 <= searchPathKeys.length - 1; z4++) {
+            if (searchPathKeys[z4] == curKey) {
+                repCount = repCount + 1
+            }
+        }
+        if (repCount >= 3) {
+            let staticEval3 = evaluate()
+            if (staticEval3 > 30) { return 0 - contemptValue }
+            if (staticEval3 < -30) { return contemptValue }
+            return 0
+        }
+    }
+
+    if (effectiveDepth == 0) {
+        return quiesce(alpha, beta)
+    }
+    let maximizing = whiteToMove
+
+    let localFrom = movesFrom
+    let localTo = movesTo
+    let localPromotion = movesPromotion
+    let localCastle = movesCastle
+    let localEP = movesEnPassant
+    let order = orderMoveIndices(depth, false)
+    let best = maximizing ? -32000 : 32000
+
+    for (let k = 0; k <= order.length - 1; k++) {
+        let idx = order[k]
+        movesFrom = localFrom; movesTo = localTo; movesPromotion = localPromotion
+        movesCastle = localCastle; movesEnPassant = localEP
+
+        let sTurn = whiteToMove
+        let sWCK = whiteCastleKing
+        let sWCQ = whiteCastleQueen
+        let sBCK = blackCastleKing
+        let sBCQ = blackCastleQueen
+        let sEP = enPassant
+        let sWHC = whiteHasCastled
+        let sBHC = blackHasCastled
+
+        makeMove(idx)
+        let sCaptured = captured
+        let moveWasIrreversible = (captured != EMPTY) || (Math.abs(piece2) == PAWN)
+        let savedIrrevIndex = searchIrreversibleIndex
+        if (moveWasIrreversible) { searchIrreversibleIndex = searchPathKeys.length }
+        searchPathKeys.push(positionKey())
+        let s = 0
+        if (searchPly + 1 >= MAX_PLY) {
+            // Safety net: this should never actually trigger in normal
+            // play (main search is capped at depth 10 + 4 check
+            // extensions = 14, far under MAX_PLY), but if it ever did,
+            // falling back to quiescence here is correct and safe rather
+            // than indexing past the end of the per-ply pools.
+            s = quiesce(alpha, beta)
+        } else {
+            searchPly = searchPly + 1
+            s = search(effectiveDepth - 1, alpha, beta, nextExtCount)
+            searchPly = searchPly - 1
+        }
+        searchPathKeys.pop()
+        searchIrreversibleIndex = savedIrrevIndex
+
+        // Same reasoning as quiesce() above -- localFrom/localTo/etc, not
+        // movesFrom[idx]/movesTo[idx], since the recursive search() call
+        // just above reassigned those globals to a deeper ply's arrays.
+        unmakeMove(localFrom[idx], localTo[idx], localPromotion[idx], localCastle[idx], localEP[idx], sCaptured); whiteToMove = sTurn
+        whiteCastleKing = sWCK; whiteCastleQueen = sWCQ
+        blackCastleKing = sBCK; blackCastleQueen = sBCQ
+        enPassant = sEP
+        whiteHasCastled = sWHC
+        blackHasCastled = sBHC
+
+        if (searchAborted) { break }
+
+        if (maximizing) {
+            if (s > best) { best = s }
+            if (best > alpha) { alpha = best }
+        } else {
+            if (s < best) { best = s }
+            if (best < beta) { beta = best }
+        }
+        if (beta <= alpha) {
+            // This move caused a beta cutoff. If it was a quiet move (not a
+            // capture or promotion -- those are already ordered well by
+            // SEE), remember it as a killer for this depth and reward it in
+            // the history table, so ordering gets better as the search goes.
+            if (board[localTo[idx]] == EMPTY && localPromotion[idx] == 0) {
+                if (depth >= 0 && depth < KILLER_SLOTS) {
+                    if (!(localFrom[idx] == killerFrom1[depth] && localTo[idx] == killerTo1[depth])) {
+                        killerFrom2[depth] = killerFrom1[depth]
+                        killerTo2[depth] = killerTo1[depth]
+                        killerFrom1[depth] = localFrom[idx]
+                        killerTo1[depth] = localTo[idx]
+                    }
+                }
+                let histPieceType2 = Math.abs(board[localFrom[idx]])
+                let histIdx = (histPieceType2 - 1) * 64 + localTo[idx]
+                historyTable[histIdx] = historyTable[histIdx] + depth * depth
+            }
+            break
+        }
+    }
+    return best
+}
+
+// ------------------------------------------------------------
+// ROOT SEARCH
+// ------------------------------------------------------------
+function findBestMove (depth: number): number {
+    // searchAborted is a global that search()/quiesce() set to true and that
+    // the root loop below checks to bail out early. findBestMoveTimed()'s own
+    // loop resets it before each depth it runs, but a PLAIN call to
+    // findBestMove() (self-play "by ply", Testing menu "by ply depth") has no
+    // such loop around it -- so without this reset, a leftover `true` from
+    // some earlier timed search (perfectly normal there: it's how a timed
+    // search ends) would make this call give up after trying just its first
+    // root move and return an unsearched fallback, even though nothing here
+    // is actually time-limited.
+    searchAborted = false
+    // Seed the search's repetition tracker fresh from the real game's
+    // history every time -- positionHistory is already pruned to only
+    // contain positions since the last capture/pawn move, so starting
+    // the scan window at 0 is correct.
+    searchPathKeys = []
+    for (let z5 = 0; z5 <= positionHistory.length - 1; z5++) {
+        searchPathKeys.push(positionHistory[z5])
+    }
+    searchIrreversibleIndex = 0
+    searchPly = 0
+
+    generateLegalMoves(whiteToMove)
+    let rootFrom = movesFrom
+    let rootTo = movesTo
+    let rootPromotion = movesPromotion
+    let rootCastle = movesCastle
+    let rootEP = movesEnPassant
+    let order = orderMoveIndices(depth, true)
+    let maximizing = whiteToMove
+    let bestIndexLocal = order[0]
+    let bestScore = maximizing ? -32000 : 32000
+    // ROOT ALPHA-BETA: every ply below the root already tightens alpha/beta
+    // as it goes (see search()'s own "if (best > alpha) alpha = best"), so
+    // each sibling move gets searched against a narrower window than the
+    // last -- except here, where every root move used to be searched
+    // against the same wide-open (-32000, 32000) window regardless of how
+    // good earlier moves already looked. That meant none of the pruning
+    // benefit from a strong first move ever reached the root's own
+    // children. Tightening these exactly the same way fixes that: this is
+    // still plain, exact alpha-beta (guaranteed to find the same best move
+    // and score as a full-width search), just no longer leaving the root
+    // ply itself out of it.
+    let rootAlpha = -32000
+    let rootBeta = 32000
+
+    for (let k = 0; k <= order.length - 1; k++) {
+        let idx = order[k]
+        movesFrom = rootFrom; movesTo = rootTo; movesPromotion = rootPromotion
+        movesCastle = rootCastle; movesEnPassant = rootEP
+
+        let sTurn = whiteToMove
+        let sWCK = whiteCastleKing
+        let sWCQ = whiteCastleQueen
+        let sBCK = blackCastleKing
+        let sBCQ = blackCastleQueen
+        let sEP = enPassant
+        let sWHC = whiteHasCastled
+        let sBHC = blackHasCastled
+
+        makeMove(idx)
+        let sCapturedR = captured
+        let moveWasIrreversibleR = (captured != EMPTY) || (Math.abs(piece2) == PAWN)
+        let savedIrrevIndexR = searchIrreversibleIndex
+        if (moveWasIrreversibleR) { searchIrreversibleIndex = searchPathKeys.length }
+        searchPathKeys.push(positionKey())
+        searchPly = 1
+        let s = search(depth - 1, rootAlpha, rootBeta, 0)
+        searchPly = 0
+        searchPathKeys.pop()
+        searchIrreversibleIndex = savedIrrevIndexR
+
+        // Same reasoning as search()/quiesce() -- rootFrom/rootTo/etc, not
+        // movesFrom[idx]/movesTo[idx], since the recursive search() call
+        // just above reassigned those globals to a deeper ply's arrays.
+        unmakeMove(rootFrom[idx], rootTo[idx], rootPromotion[idx], rootCastle[idx], rootEP[idx], sCapturedR); whiteToMove = sTurn
+        whiteCastleKing = sWCK; whiteCastleQueen = sWCQ
+        blackCastleKing = sBCK; blackCastleQueen = sBCQ
+        enPassant = sEP
+        whiteHasCastled = sWHC
+        blackHasCastled = sBHC
+
+        if (searchAborted) { break }
+
+        if (maximizing) {
+            if (s > bestScore) { bestScore = s; bestIndexLocal = idx }
+            if (bestScore > rootAlpha) { rootAlpha = bestScore }
+        } else {
+            if (s < bestScore) { bestScore = s; bestIndexLocal = idx }
+            if (bestScore < rootBeta) { rootBeta = bestScore }
+        }
+    }
+    movesFrom = rootFrom; movesTo = rootTo; movesPromotion = rootPromotion
+    movesCastle = rootCastle; movesEnPassant = rootEP
+    if (!searchAborted) {
+        // Remember this depth's best root move so the NEXT (deeper) call
+        // from findBestMoveTimed's iterative-deepening loop can try it
+        // first -- a cheap, low-risk stand-in for a full transposition
+        // table, since the previous iteration's best move is usually still
+        // a very strong candidate one ply deeper.
+        rootPVFrom = movesFrom[bestIndexLocal]
+        rootPVTo = movesTo[bestIndexLocal]
+    }
+    return bestIndexLocal
+}
+
+// ------------------------------------------------------------
+// TIME-BUDGETED ITERATIVE DEEPENING
+// ------------------------------------------------------------
+function findBestMoveTimed (maxMillis: number): number {
+    // If there's only one legal move (e.g. in check with a single way out),
+    // there's nothing to think about -- play it instantly instead of
+    // burning the whole time budget.
+    generateLegalMoves(whiteToMove)
+    if (movesFrom.length == 1) {
+        return 0
+    }
+
+    // Hard deadline checked *inside* search()/quiesce() themselves (not just
+    // between depths), so a search can be aborted immediately no matter how
+    // deep it has recursed. Any depth that gets aborted partway through is
+    // discarded entirely -- we fall back to the last fully-completed depth.
+    searchStartTime = input.runningTime()
+    searchDeadline = searchStartTime + maxMillis
+    searchBudgetMillis = maxMillis
+    resetSearchMemory()
+    animationEnabled = true
+    lastLedCount = 0
+    lastLedUpdateTime = 0
+    debugNodeCount = 0
+    lastDebugUpdateTime = 0
+    basic.clearScreen()
+    let bestIndexOverall = -1
+    let depth = 1
+    lastCompletedDepth = 0
+    while (depth <= 10) {
+        searchAborted = false
+        let candidate = findBestMove(depth)
+        if (searchAborted) {
+            // Depth aborted partway through. findBestMove still returns a
+            // legal move (it starts from order[0] and only improves from
+            // there), so use it as a last-resort fallback if we don't have
+            // ANY completed depth yet -- this only matters for absurdly
+            // tight time budgets that can't even finish depth 1.
+            if (bestIndexOverall < 0) { bestIndexOverall = candidate }
+            break
+        }
+        bestIndexOverall = candidate
+        lastCompletedDepth = depth
+        depth = depth + 1
+        if (input.runningTime() >= searchDeadline) {
+            break
+        }
+    }
+    animationEnabled = false
+    basic.clearScreen()
+    // searchDeadline is a global that search()/quiesce() check unconditionally,
+    // no matter who is calling them. If we leave it sitting at the value we
+    // set above, it stays stuck in the past forever -- and every future PLAIN
+    // findBestMove() call (self-play "by ply", Testing menu "by ply depth")
+    // would then abort on its very first node and silently fall back to an
+    // unsearched move. Reset it to "no limit" now that this timed search is
+    // over, so it can't leak into anything that isn't time-limited.
+    searchDeadline = 2147483647
+    return bestIndexOverall
+}
+
+// ------------------------------------------------------------
+// MOVE / GAME HELPERS
+// ------------------------------------------------------------
+function moveName (index: number) {
+    return "" + squareName(movesFrom[index]) + "-" + squareName(movesTo[index])
+}
+
+function showMove (index: number) {
+    basic.showString("" + (moveName(index)))
+}
+
+// ------------------------------------------------------------
+// THREEFOLD REPETITION
+//
+// positionHistory holds a key for every position reached in the REAL
+// game so far (not hypothetical search moves). It's cleared every time
+// a capture or pawn move happens, because after an irreversible move
+// like that the exact earlier position can never occur again -- so
+// there's no need to keep comparing against it, which also keeps this
+// list (and the repetition check) cheap even in a long game.
+// ------------------------------------------------------------
+let positionHistory: number[] = []
+
+// A key that identifies "the position" for repetition purposes: the
+// board, whose turn it is, and castling rights, folded into a single
+// number via a simple polynomial rolling hash instead of a concatenated
+// string. This is called on every move tried anywhere in the search tree
+// (not just once per node), and the old string-building version did 64+
+// string concatenations -- each one a fresh heap allocation -- every
+// single time. That was almost certainly the single biggest source of
+// the allocation churn behind the "out of memory" panic: worse than the
+// move-list/board-copy churn the per-ply pools above fix, because it ran
+// even more often. A numeric hash does the same 64-square scan but with
+// plain arithmetic, no allocation at all. Collisions are astronomically
+// unlikely here (a 32-bit hash space against the handful of positions
+// ever compared in a repetition window at once) and this is only used
+// for repetition/contempt heuristics, never for move legality, so the
+// negligible remaining risk isn't safety-critical.
+function positionKey (): number {
+    let key = 0
+    for (let z = 0; z <= 63; z++) {
+        key = (key * 33 + board[z] + 8) | 0
+    }
+    key = (key * 33 + (whiteToMove ? 1 : 0)) | 0
+    key = (key * 33 + (whiteCastleKing ? 1 : 0)) | 0
+    key = (key * 33 + (whiteCastleQueen ? 1 : 0)) | 0
+    key = (key * 33 + (blackCastleKing ? 1 : 0)) | 0
+    key = (key * 33 + (blackCastleQueen ? 1 : 0)) | 0
+    return key
+}
+
+// Call right after making a REAL move (not a hypothetical search move).
+// `irreversible` should be true if that move was a capture or a pawn
+// move -- pass (captured != EMPTY) || (Math.abs(piece2) == PAWN), read
+// right after makeMove() sets those two scratch variables as a side
+// effect of making the move.
+function recordPosition (irreversible: boolean): void {
+    if (irreversible) {
+        positionHistory = []
+    }
+    positionHistory.push(positionKey())
+}
+
+function countRepetitions (key: number): number {
+    let cnt = 0
+    for (let z2 = 0; z2 <= positionHistory.length - 1; z2++) {
+        if (positionHistory[z2] == key) {
+            cnt = cnt + 1
+        }
+    }
+    return cnt
+}
+
+function playMove (fromName: string, toName: string) {
+    from2 = squareFromName(fromName)
+    to8 = squareFromName(toName)
+    if (from2 < 0 || to8 < 0) {
+        return false
+    }
+    generateLegalMoves(whiteToMove)
+    for (let i5 = 0; i5 <= movesFrom.length - 1; i5++) {
+        if (movesFrom[i5] == from2 && movesTo[i5] == to8) {
+            makeMove(i5)
+            recordPosition((captured != EMPTY) || (Math.abs(piece2) == PAWN))
+            return true
+        }
+    }
+    return false
+}
+
+function resetBoard () {
+    initPools()
+    board = []
+    for (let index = 0; index < 64; index++) {
+        board.push(EMPTY)
+    }
+    // Black pieces
+    board[0] = 0 - ROOK
+    board[1] = 0 - KNIGHT
+    board[2] = 0 - BISHOP
+    board[3] = 0 - QUEEN
+    board[4] = 0 - KING
+    board[5] = 0 - BISHOP
+    board[6] = 0 - KNIGHT
+    board[7] = 0 - ROOK
+    for (let s = 8; s < 16; s++) {
+        board[s] = -PAWN
+    }
+    // White pieces
+    board[56] = ROOK
+    board[57] = KNIGHT
+    board[58] = BISHOP
+    board[59] = QUEEN
+    board[60] = KING
+    board[61] = BISHOP
+    board[62] = KNIGHT
+    board[63] = ROOK
+    for (let u = 48; u < 56; u++) {
+        board[u] = PAWN
+    }
+    whiteToMove = true
+    whiteCastleKing = true
+    whiteCastleQueen = true
+    blackCastleKing = true
+    blackCastleQueen = true
+    whiteHasCastled = false
+    blackHasCastled = false
+    // En-passant target square. -1 means there isn't one.
+    enPassant = -1
+    positionHistory = []
+    positionHistory.push(positionKey())
+    resetSearchMemory()
+}
+
+// ------------------------------------------------------------
+// TEST GAME
+// ------------------------------------------------------------
+function testGame () {
+    resetBoard()
+    // 1. e2-e4
+    if (playMove("e2", "e4")) {
+        basic.showString("E2-E4")
+    } else {
+        basic.showString("ERROR")
+        return
+    }
+    // 1... e7-e5
+    if (playMove("e7", "e5")) {
+        basic.showString("E7-E5")
+    } else {
+        basic.showString("ERROR")
+        return
+    }
+    // 2. g1-f3
+    if (playMove("g1", "f3")) {
+        basic.showString("G1-F3")
+    } else {
+        basic.showString("ERROR")
+        return
+    }
+    // 2... b8-c6
+    if (playMove("b8", "c6")) {
+        basic.showString("B8-C6")
+    } else {
+        basic.showString("ERROR")
+        return
+    }
+    basic.showIcon(IconNames.Happy)
+    // Now let the AI choose Black's next move, thinking for up to 35s
+    aiMove = findBestMoveTimed(35000)
+    basic.clearScreen()
+    basic.pause(300)
+    basic.showString("" + (moveName(aiMove)))
+    makeMove(aiMove)
+}
+
+// ============================================================
+// PHYSICAL GAME: OLED display + joystick:bit input
+//
+// Requires two MakeCode extensions to be added first (gearwheel
+// menu -> Extensions -> search and add each one):
+//   - "128x64Display"  (KitronikLtd, for the :VIEW 128x64 OLED)
+//   - "joystickbit"    (ELECFREAKS, for the joystick:bit)
+//
+// Board is shown as 8 text lines (rank 8 at the top, rank 1 at
+// the bottom -- the normal orientation from White's point of
+// view). Each square is 3 characters wide: " P " for a normal
+// square, "[P]" for the square the cursor is on, "(P)" for the
+// square you've picked up a piece from, and "{P}" when the
+// cursor is sitting on the square you've picked up.
+// Uppercase letters = White, lowercase = Black, "." = empty.
+//
+// Controls: move the joystick to move the cursor one square at
+// a time (release back to centre before it will move again).
+// Press C (joystick:bit) to pick up the piece under the cursor,
+// move the cursor to where you want it to go, and press D
+// (joystick:bit) to drop it there and play the move. Press D on
+// the same square you picked up to cancel, or press C on a
+// different one of your own pieces to change your selection.
+// Press B (the micro:bit's own button) at any time to cancel a
+// selection outright.
+//
+// While the engine is thinking, the micro:bit's 5x5 LED grid fills up
+// (roughly one more LED per 1/25th of whatever think-time is currently
+// configured) so you can see how much of its thinking time is left.
+//
+// You play White; the engine plays Black and thinks for however long the
+// Strength menu is set to (2-120 seconds, default 35).
+//
+// While it's your move, press E (joystick:bit) to see the engine's last
+// move (in long algebraic notation) and the current static evaluation of
+// the position, from White's point of view (positive = good for White).
+//
+// If the cursor moves the wrong way compared to the joystick,
+// flip INVERT_X and/or INVERT_Y below and re-flash.
+// ============================================================
+
+let INVERT_X = false
+let INVERT_Y = false
+let JOY_LOW = 300
+let JOY_HIGH = 700
+
+// Auto-repeat: holding the joystick in a direction (rather than tapping
+// it) moves once immediately, waits JOY_REPEAT_DELAY_MS to make sure it's
+// a genuine hold and not just a slightly-long tap, then keeps moving
+// every JOY_REPEAT_INTERVAL_MS for as long as it's held -- instead of
+// requiring the stick to be recentered and re-pushed for every single
+// step, which was painfully slow for anything more than 3-4 steps (the
+// value picker's 1-600 second range being the case that made this
+// obvious).
+let JOY_REPEAT_DELAY_MS = 400
+let JOY_REPEAT_INTERVAL_MS = 120
+
+let cursorRow = 7
+let cursorCol = 4
+let selectedFrom = -1
+let lastXDir = 0
+let lastYDir = 0
+let xNextRepeatTime = 0
+let yNextRepeatTime = 0
+let lastCPressed = false
+let lastDPressed = false
+let lastBPressed = false
+let lastEPressed = false
+
+// ------------------------------------------------------------
+// MENU / CONFIGURATION STATE
+// ------------------------------------------------------------
+// How long (ms) the engine thinks per move in a normal human-vs-engine
+// game, set from the "Strength" menu. Replaces what used to be a hardcoded
+// 35000 passed straight to findBestMoveTimed().
+let aiThinkMillis = 35000
+
+// Self-play configuration, set from the "Self Play" menu.
+// selfPlayMode: 0 = fixed ply depth (findBestMove), 1 = fixed time per
+// move (findBestMoveTimed) -- these are genuinely different engine calls,
+// not just the same search with a different stopping rule, so self-play
+// can be used to compare "how strong is depth N" against "how strong is N
+// seconds of iterative deepening" on real hardware.
+let selfPlayMode = 1
+let selfPlayDepth = 3
+let selfPlayMillis = 5000
+
+// Long-algebraic text for the engine's most recent move, shown on demand
+// (press E during your own move) rather than automatically, so it doesn't
+// interrupt normal play.
+let lastEngineMoveText = "none yet"
+
+function pieceChar (p: number): string {
+    let a = Math.abs(p)
+    let ch = "."
+    if (a == PAWN) {
+        ch = p > 0 ? "P" : "p"
+    } else if (a == KNIGHT) {
+        ch = p > 0 ? "N" : "n"
+    } else if (a == BISHOP) {
+        ch = p > 0 ? "B" : "b"
+    } else if (a == ROOK) {
+        ch = p > 0 ? "R" : "r"
+    } else if (a == QUEEN) {
+        ch = p > 0 ? "Q" : "q"
+    } else if (a == KING) {
+        ch = p > 0 ? "K" : "k"
+    }
+    return ch
+}
+
+function buildBoardLine (rowIndex: number): string {
+    let line = ""
+    for (let colIndex = 0; colIndex <= 7; colIndex++) {
+        let sqIdx = squareFromRC(rowIndex, colIndex)
+        let ch = pieceChar(board[sqIdx])
+        let isCursor = rowIndex == cursorRow && colIndex == cursorCol
+        let isSelected = selectedFrom == sqIdx
+        if (isCursor && isSelected) {
+            line = line + "{" + ch + "}"
+        } else if (isCursor) {
+            line = line + "[" + ch + "]"
+        } else if (isSelected) {
+            line = line + "(" + ch + ")"
+        } else {
+            line = line + " " + ch + " "
+        }
+    }
+    return line
+}
+
+function drawBoardLine (rowIndex: number): void {
+    let text = buildBoardLine(rowIndex)
+    kitronik_VIEW128x64.clearLine(rowIndex + 1)
+    kitronik_VIEW128x64.show(text, rowIndex + 1)
+}
+
+function drawBoard (): void {
+    for (let ln = 0; ln <= 7; ln++) {
+        drawBoardLine(ln)
+    }
+}
+
+function showStatus (line1: string, line2: string, line3: string): void {
+    kitronik_VIEW128x64.clear()
+    kitronik_VIEW128x64.show(line1, 3)
+    kitronik_VIEW128x64.show(line2, 4)
+    kitronik_VIEW128x64.show(line3, 5)
+}
+
+// Formats a centipawn score as a signed pawns-and-hundredths string, e.g.
+// 135 -> "+1.35", -40 -> "-0.40", 0 -> "+0.00". Positive = good for White.
+// Built with plain arithmetic and string concatenation (no toFixed/etc,
+// matching the rest of this file's MakeCode-safe style).
+function formatEvalCentipawns (score: number): string {
+    let sign = score < 0 ? "-" : "+"
+    let mag = Math.abs(score)
+    let whole = Math.floor(mag / 100)
+    let frac = mag % 100
+    let fracStr = frac < 10 ? "0" + frac : "" + frac
+    return sign + whole + "." + fracStr
+}
+
+// ------------------------------------------------------------
+// MENU SYSTEM
+// ------------------------------------------------------------
+// Set to true by runValuePicker() when the player backs out with B,
+// instead of confirming with C, so the caller knows to abandon whatever
+// it was about to configure rather than use the returned value.
+let menuCancelled = false
+
+function drawMenuList (title: string, options: string[], selIndex: number): void {
+    kitronik_VIEW128x64.clear()
+    kitronik_VIEW128x64.show(title, 1)
+    for (let i = 0; i <= options.length - 1; i++) {
+        let line = (i == selIndex ? "> " : "  ") + options[i]
+        kitronik_VIEW128x64.show(line, 3 + i)
+    }
+}
+
+// Redraws just the two lines whose ">" marker actually changed, instead
+// of a full clear() plus re-showing every option -- same reasoning as
+// updateValuePickerValue below. The title and every non-affected option
+// line stay exactly as they were on screen.
+function updateMenuSelection (options: string[], prevIndex: number, newIndex: number): void {
+    if (prevIndex == newIndex) {
+        return
+    }
+    kitronik_VIEW128x64.clearLine(3 + prevIndex)
+    kitronik_VIEW128x64.show("  " + options[prevIndex], 3 + prevIndex)
+    kitronik_VIEW128x64.clearLine(3 + newIndex)
+    kitronik_VIEW128x64.show("> " + options[newIndex], 3 + newIndex)
+}
+
+// Simple joystick-driven list menu: Y moves the highlight up/down
+// (wrapping), C confirms. Returns the chosen option's index.
+function runMenu (title: string, options: string[], startIndex: number): number {
+    let selIndex = startIndex
+    let lastY = 0
+    let yNextRepeat = 0
+    let cLast = joystickbit.getButton(joystickbit.JoystickBitPin.P12)
+    drawMenuList(title, options, selIndex)
+    while (true) {
+        let y = joystickbit.getRockerValue(joystickbit.rockerType.Y)
+        let yDir = 0
+        if (y < JOY_LOW) { yDir = -1 } else if (y > JOY_HIGH) { yDir = 1 }
+        if (INVERT_Y) { yDir = 0 - yDir }
+
+        let now = input.runningTime()
+        let prevSelIndex = selIndex
+        let moved = false
+        if (yDir != 0) {
+            if (lastY == 0) {
+                selIndex = selIndex + yDir
+                yNextRepeat = now + JOY_REPEAT_DELAY_MS
+                moved = true
+            } else if (yDir == lastY && now >= yNextRepeat) {
+                selIndex = selIndex + yDir
+                yNextRepeat = now + JOY_REPEAT_INTERVAL_MS
+                moved = true
+            }
+            if (selIndex < 0) { selIndex = options.length - 1 }
+            if (selIndex >= options.length) { selIndex = 0 }
+        }
+        lastY = yDir
+
+        let cNow = joystickbit.getButton(joystickbit.JoystickBitPin.P12)
+        let cPressed = cNow && !(cLast)
+        cLast = cNow
+
+        if (moved) { updateMenuSelection(options, prevSelIndex, selIndex) }
+        if (cPressed) { return selIndex }
+        basic.pause(100)
+    }
+}
+
+function drawValuePicker (title: string, value: number, unitLabel: string): void {
+    kitronik_VIEW128x64.clear()
+    kitronik_VIEW128x64.show(title, 2)
+    kitronik_VIEW128x64.show("" + value + " " + unitLabel, 4)
+    kitronik_VIEW128x64.show("Y:+/- C:OK B:back", 6)
+}
+
+// Only the value line actually changes as you turn the joystick -- the
+// title and instructions never do -- so redrawing the whole screen (a
+// full clear() plus re-showing all 3 lines) on every single step was
+// pure waste, and with auto-repeat now firing every 120ms while held,
+// that waste was the actual bottleneck on how fast the value could
+// change. This updates just line 4.
+function updateValuePickerValue (value: number, unitLabel: string): void {
+    kitronik_VIEW128x64.clearLine(4)
+    kitronik_VIEW128x64.show("" + value + " " + unitLabel, 4)
+}
+
+// Joystick-driven numeric picker: Y up/down adjusts the value by `step`
+// (clamped to [minValue, maxValue]), C confirms and returns the value, B
+// cancels (sets menuCancelled = true and returns the value unchanged --
+// callers must check menuCancelled rather than trust the return alone).
+function runValuePicker (title: string, initialValue: number, minValue: number, maxValue: number, step: number, unitLabel: string): number {
+    let value = initialValue
+    let lastY = 0
+    let yNextRepeat = 0
+    let cLast = joystickbit.getButton(joystickbit.JoystickBitPin.P12)
+    let bLast = input.buttonIsPressed(Button.B)
+    menuCancelled = false
+    drawValuePicker(title, value, unitLabel)
+    while (true) {
+        let y = joystickbit.getRockerValue(joystickbit.rockerType.Y)
+        let yDir = 0
+        if (y < JOY_LOW) { yDir = -1 } else if (y > JOY_HIGH) { yDir = 1 }
+        if (INVERT_Y) { yDir = 0 - yDir }
+
+        let now = input.runningTime()
+        let moved = false
+        if (yDir != 0) {
+            if (lastY == 0) {
+                value = value - yDir * step
+                yNextRepeat = now + JOY_REPEAT_DELAY_MS
+                moved = true
+            } else if (yDir == lastY && now >= yNextRepeat) {
+                value = value - yDir * step
+                yNextRepeat = now + JOY_REPEAT_INTERVAL_MS
+                moved = true
+            }
+            if (value < minValue) { value = minValue }
+            if (value > maxValue) { value = maxValue }
+        }
+        lastY = yDir
+
+        let cNow = joystickbit.getButton(joystickbit.JoystickBitPin.P12)
+        let cPressed = cNow && !(cLast)
+        cLast = cNow
+
+        let bNow = input.buttonIsPressed(Button.B)
+        let bPressed = bNow && !(bLast)
+        bLast = bNow
+
+        if (moved) { updateValuePickerValue(value, unitLabel) }
+        if (cPressed) { return value }
+        if (bPressed) { menuCancelled = true; return value }
+        basic.pause(100)
+    }
+}
+
+function squareOwnedBySideToMove (sqIdx: number): boolean {
+    let p = board[sqIdx]
+    if (p == EMPTY) {
+        return false
+    }
+    if (whiteToMove) {
+        return p > 0
+    } else {
+        return p < 0
+    }
+}
+
+function squareHasLegalMoveFrom (square: number): boolean {
+    for (let i = 0; i <= movesFrom.length - 1; i++) {
+        if (movesFrom[i] == square) {
+            return true
+        }
+    }
+    return false
+}
+
+function findLegalMoveIndex (fromSq: number, toSq: number): number {
+    for (let i = 0; i <= movesFrom.length - 1; i++) {
+        if (movesFrom[i] == fromSq && movesTo[i] == toSq) {
+            return i
+        }
+    }
+    return -1
+}
+
+// Reads the joystick and moves the cursor by at most one square
+// per call. Requires the stick to pass back through the centre
+// dead zone before it will register another move in the same
+// direction, so holding it over doesn't cause runaway movement.
+// Returns true if the cursor actually moved.
+function pollJoystickCursor (): boolean {
+    let x = joystickbit.getRockerValue(joystickbit.rockerType.X)
+    let y = joystickbit.getRockerValue(joystickbit.rockerType.Y)
+    let xDir = 0
+    if (x < JOY_LOW) {
+        xDir = -1
+    } else if (x > JOY_HIGH) {
+        xDir = 1
+    }
+    let yDir = 0
+    if (y < JOY_LOW) {
+        yDir = -1
+    } else if (y > JOY_HIGH) {
+        yDir = 1
+    }
+    if (INVERT_X) {
+        xDir = 0 - xDir
+    }
+    if (INVERT_Y) {
+        yDir = 0 - yDir
+    }
+
+    let now = input.runningTime()
+    let moved = false
+    if (xDir != 0) {
+        if (lastXDir == 0) {
+            cursorCol = cursorCol + xDir
+            xNextRepeatTime = now + JOY_REPEAT_DELAY_MS
+            moved = true
+        } else if (xDir == lastXDir && now >= xNextRepeatTime) {
+            cursorCol = cursorCol + xDir
+            xNextRepeatTime = now + JOY_REPEAT_INTERVAL_MS
+            moved = true
+        }
+        if (cursorCol < 0) { cursorCol = 0 }
+        if (cursorCol > 7) { cursorCol = 7 }
+    }
+    if (yDir != 0) {
+        if (lastYDir == 0) {
+            cursorRow = cursorRow + yDir
+            yNextRepeatTime = now + JOY_REPEAT_DELAY_MS
+            moved = true
+        } else if (yDir == lastYDir && now >= yNextRepeatTime) {
+            cursorRow = cursorRow + yDir
+            yNextRepeatTime = now + JOY_REPEAT_INTERVAL_MS
+            moved = true
+        }
+        if (cursorRow < 0) { cursorRow = 0 }
+        if (cursorRow > 7) { cursorRow = 7 }
+    }
+    lastXDir = xDir
+    lastYDir = yDir
+    return moved
+}
+
+// Blocks until the human player (White) has made a legal move,
+// then applies it with makeMove() and returns. Assumes
+// generateLegalMoves(whiteToMove) has already been called by the
+// caller so movesFrom/movesTo hold White's current legal moves.
+function waitForPlayerMove (): void {
+    selectedFrom = -1
+    drawBoard()
+    while (true) {
+        let priorCursorRow = cursorRow
+        let moved = pollJoystickCursor()
+        // C (joystick:bit) = pick up / switch selection. D (joystick:bit) =
+        // drop onto the cursor's square. B (micro:bit onboard) = cancel.
+        let cNow = joystickbit.getButton(joystickbit.JoystickBitPin.P12)
+        let dNow = joystickbit.getButton(joystickbit.JoystickBitPin.P13)
+        let eNow = joystickbit.getButton(joystickbit.JoystickBitPin.P14)
+        let bNow = input.buttonIsPressed(Button.B)
+        let cPressed = cNow && !(lastCPressed)
+        let dPressed = dNow && !(lastDPressed)
+        let ePressed = eNow && !(lastEPressed)
+        let bPressed = bNow && !(lastBPressed)
+        lastCPressed = cNow
+        lastDPressed = dNow
+        lastEPressed = eNow
+        lastBPressed = bNow
+
+        if (ePressed) {
+            // Info overlay: doesn't touch board/selection state, so once
+            // it's dismissed we just redraw the board and carry on.
+            showStatus("Engine played:", lastEngineMoveText, "Eval: " + formatEvalCentipawns(evaluate()))
+            basic.pause(2500)
+            drawBoard()
+        }
+
+        // Tracked separately from plain cursor movement: a selection
+        // change can mark up a square on a totally different row than
+        // the cursor (the piece you picked up stays marked while you
+        // move the cursor elsewhere to choose where to drop it), so it
+        // still gets a full, guaranteed-correct drawBoard(). That's fine
+        // performance-wise -- C/D/B are single presses, not something
+        // auto-repeat fires many times a second the way cursor movement
+        // now does.
+        let selectionChanged = false
+
+        if (bPressed && selectedFrom >= 0) {
+            selectedFrom = -1
+            selectionChanged = true
+        }
+
+        if (cPressed) {
+            let sqIdx = squareFromRC(cursorRow, cursorCol)
+            if (sqIdx != selectedFrom && squareOwnedBySideToMove(sqIdx) && squareHasLegalMoveFrom(sqIdx)) {
+                selectedFrom = sqIdx
+                selectionChanged = true
+            }
+        }
+
+        if (dPressed && selectedFrom >= 0) {
+            let sqIdx = squareFromRC(cursorRow, cursorCol)
+            if (sqIdx == selectedFrom) {
+                selectedFrom = -1
+                selectionChanged = true
+            } else {
+                let idx = findLegalMoveIndex(selectedFrom, sqIdx)
+                if (idx >= 0) {
+                    makeMove(idx)
+                    recordPosition((captured != EMPTY) || (Math.abs(piece2) == PAWN))
+                    selectedFrom = -1
+                    if (inCheck(whiteToMove)) {
+                        showStatus("Check!", "", "")
+                        basic.pause(800)
+                    }
+                    return
+                }
+                // Not a legal target for the piece we're holding -- ignored,
+                // selection stays put. Press C on a different own piece to
+                // switch what's picked up, or B to cancel.
+            }
+        }
+
+        if (selectionChanged) {
+            drawBoard()
+        } else if (moved) {
+            // Pure cursor movement: only the row(s) the cursor actually
+            // left/entered changed on screen -- everything else on the
+            // board (including up to 7 other rows) is exactly as it was,
+            // so redrawing it is wasted OLED time. This is the path
+            // auto-repeat hits repeatedly while the joystick is held,
+            // so it's the one that matters most for feel.
+            if (cursorRow != priorCursorRow) {
+                drawBoardLine(priorCursorRow)
+                drawBoardLine(cursorRow)
+            } else {
+                drawBoardLine(cursorRow)
+            }
+        }
+        basic.pause(100)
+    }
+}
+
+function playPhysicalGame (): void {
+    resetBoard()
+    joystickbit.initJoystickBit()
+    cursorRow = 7
+    cursorCol = 4
+    selectedFrom = -1
+    lastXDir = 0
+    lastYDir = 0
+    xNextRepeatTime = 0
+    yNextRepeatTime = 0
+    lastCPressed = joystickbit.getButton(joystickbit.JoystickBitPin.P12)
+    lastDPressed = joystickbit.getButton(joystickbit.JoystickBitPin.P13)
+    lastEPressed = joystickbit.getButton(joystickbit.JoystickBitPin.P14)
+    lastBPressed = input.buttonIsPressed(Button.B)
+    lastEngineMoveText = "none yet"
+
+    while (true) {
+        generateLegalMoves(whiteToMove)
+        if (movesFrom.length == 0) {
+            if (inCheck(whiteToMove)) {
+                if (whiteToMove) {
+                    showStatus("Checkmate!", "Black wins", "")
+                } else {
+                    showStatus("Checkmate!", "White wins", "")
+                }
+            } else {
+                showStatus("Stalemate", "It's a draw", "")
+            }
+            break
+        }
+        if (countRepetitions(positionKey()) >= 3) {
+            showStatus("Draw by", "repetition", "")
+            break
+        }
+        if (whiteToMove) {
+            waitForPlayerMove()
+        } else {
+            showStatus("AI is", "thinking...", "(up to " + Math.floor(aiThinkMillis / 1000) + "s)")
+            aiMove = findBestMoveTimed(aiThinkMillis)
+            lastEngineMoveText = moveName(aiMove)
+            makeMove(aiMove)
+            recordPosition((captured != EMPTY) || (Math.abs(piece2) == PAWN))
+            if (inCheck(whiteToMove)) {
+                showStatus("Check!", "", "")
+                basic.pause(800)
+            }
+        }
+    }
+    basic.pause(4000)
+}
+
+// ------------------------------------------------------------
+// SELF-PLAY MODE (engine vs itself, for benchmarking on real hardware)
+// ------------------------------------------------------------
+function runSelfPlayGame (): void {
+    resetBoard()
+    joystickbit.initJoystickBit()
+    lastBPressed = input.buttonIsPressed(Button.B)
+
+    while (true) {
+        generateLegalMoves(whiteToMove)
+        if (movesFrom.length == 0) {
+            if (inCheck(whiteToMove)) {
+                if (whiteToMove) {
+                    showStatus("Checkmate!", "Black wins", "")
+                } else {
+                    showStatus("Checkmate!", "White wins", "")
+                }
+            } else {
+                showStatus("Stalemate", "It's a draw", "")
+            }
+            break
+        }
+        if (countRepetitions(positionKey()) >= 3) {
+            showStatus("Draw by", "repetition", "")
+            break
+        }
+        drawBoard()
+        // Give the player a chance to bail out before the engine commits
+        // to what might be a long think -- self-play games have no other
+        // way to interrupt them.
+        let bNow = input.buttonIsPressed(Button.B)
+        let bPressed = bNow && !(lastBPressed)
+        lastBPressed = bNow
+        if (bPressed) {
+            showStatus("Self-play", "stopped", "")
+            break
+        }
+
+        let mv = 0
+        if (selfPlayMode == 0) {
+            mv = findBestMove(selfPlayDepth)
+        } else {
+            mv = findBestMoveTimed(selfPlayMillis)
+        }
+        lastEngineMoveText = moveName(mv)
+        makeMove(mv)
+        recordPosition((captured != EMPTY) || (Math.abs(piece2) == PAWN))
+    }
+    basic.pause(4000)
+}
+
+// ------------------------------------------------------------
+// TOP-LEVEL MENU
+// ------------------------------------------------------------
+function strengthMenuAndPlay (): void {
+    let seconds = Math.floor(aiThinkMillis / 1000)
+    let result = runValuePicker("Think time", seconds, 2, 120, 1, "sec")
+    if (menuCancelled) {
+        return
+    }
+    aiThinkMillis = result * 1000
+    playPhysicalGame()
+}
+
+function selfPlayMenuAndRun (): void {
+    let modeChoice = runMenu("Self-play mode", ["By ply depth", "By time/move"], selfPlayMode)
+    selfPlayMode = modeChoice
+    if (selfPlayMode == 0) {
+        let result = runValuePicker("Max ply depth", selfPlayDepth, 1, 8, 1, "ply")
+        if (menuCancelled) {
+            return
+        }
+        selfPlayDepth = result
+    } else {
+        let seconds = Math.floor(selfPlayMillis / 1000)
+        let result = runValuePicker("Sec per move", seconds, 1, 60, 1, "sec")
+        if (menuCancelled) {
+            return
+        }
+        selfPlayMillis = result * 1000
+    }
+    runSelfPlayGame()
+}
+
+// ------------------------------------------------------------
+// TESTING: hardcoded positions from real games, so a specific
+// tricky moment can be re-examined at different ply depths / time
+// budgets without replaying an entire game to reach it again.
+//
+// Board data is stored FLAT (one 256-entry number[] covering all 4
+// positions, 64 squares each) rather than as number[][] (an array of
+// arrays). A nested array literal is untested on this compile target,
+// and after two separate cases this project already hit of code that
+// is completely valid TypeScript/JS but not supported by the actual
+// on-device compiler (the .length setter; see historyTable's memory
+// story above), a flat array using indexing we already know works
+// everywhere else in this file is the safer bet over guessing that
+// number[][] literals are fine.
+//
+// Loading a test position (loadTestPosition) resets search memory and
+// position history to a clean slate, so results are reproducible and
+// don't carry move-ordering bias left over from whatever ran earlier
+// -- unlike a position reached by actually playing through a live
+// game, where historyTable/killer moves have already accumulated a
+// game's worth of bias by the time you get there.
+//
+// To add more positions: get a FEN (from Lichess, a PGN viewer, etc)
+// and convert it with fen-to-ts.js / generate-test-positions.js in
+// the project's test-harness folder, then extend the arrays below.
+// ------------------------------------------------------------
+let TEST_POSITION_COUNT = 4
+let testLabels: string[] = ["8...Ne6?", "10.Bxc6+ or Ba4?", "14.Qd3 or exd5?", "15.exd5 or ...?"]
+let testBoardsFlat: number[] = [-4, 0, 0, -5, -6, -3, 0, -4, -1, -1, -1, 0, -1, -1, -1, 0, 0, 0, -2, 0, 0, 0, 0, -1, 0, 0, 0, -1, 0, 0, 0, 0, 0, 0, 0, 1, 0, -2, 1, 0, 0, 0, 2, 0, 1, 2, 0, 0, 1, 1, 1, 0, 0, 1, 1, 0, 4, 0, 0, 5, 6, 3, 0, 4, -4, 0, 0, -5, -6, -3, 0, -4, 0, -1, -1, 0, -1, -1, -1, 0, -1, 0, -2, 0, -2, 0, 0, -1, 0, 3, 0, -1, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 1, 0, 0, 0, 2, 0, 1, 2, 0, 0, 1, 1, 1, 0, 0, 1, 1, 0, 4, 0, 0, 5, 6, 0, 0, 4, 0, -4, 0, 0, -6, -3, 0, -4, 0, 0, -1, 0, -1, -1, -1, 0, -1, 0, -1, 0, -2, 0, 0, -1, 0, 0, 0, -1, 0, 0, 0, 0, 0, 0, 0, 1, 1, -5, 1, 0, 0, 0, 2, 0, 0, 2, 0, 0, 1, 1, 1, 0, 0, 1, 1, 0, 0, 4, 0, 5, 0, 4, 6, 0, 0, -4, 0, 0, -6, -3, 0, -4, 0, 0, -1, 0, -1, -1, -1, 0, -1, 0, -1, 0, -2, 0, 0, -1, 0, 0, 0, -1, 0, 0, 0, 0, 0, 0, 0, 1, 1, 0, -5, 0, 0, 0, 2, 5, 0, 2, 0, 0, 1, 1, 1, 0, 0, 1, 1, 0, 0, 4, 0, 0, 0, 4, 6, 0]
+let testWhiteToMove: boolean[] = [false, true, true, true]
+let testWCK: boolean[] = [true, true, false, false]
+let testWCQ: boolean[] = [true, true, false, false]
+let testBCK: boolean[] = [true, true, true, true]
+let testBCQ: boolean[] = [true, true, false, false]
+let testEP: number[] = [-1, -1, -1, -1]
+let testWHC: boolean[] = [false, false, true, true]
+let testBHC: boolean[] = [false, false, false, false]
+
+let testPositionIndex = 0
+let testSearchMode = 0
+let testSearchDepth = 3
+let testSearchMillis = 5000
+
+function loadTestPosition (idx: number): void {
+    initPools()
+    board = []
+    let base = idx * 64
+    for (let s = 0; s < 64; s++) {
+        board.push(testBoardsFlat[base + s])
+    }
+    whiteToMove = testWhiteToMove[idx]
+    whiteCastleKing = testWCK[idx]
+    whiteCastleQueen = testWCQ[idx]
+    blackCastleKing = testBCK[idx]
+    blackCastleQueen = testBCQ[idx]
+    enPassant = testEP[idx]
+    whiteHasCastled = testWHC[idx]
+    blackHasCastled = testBHC[idx]
+    positionHistory = []
+    positionHistory.push(positionKey())
+    resetSearchMemory()
+}
+
+function showTestResult (label: string, moveText: string, evalScore: number, elapsedMs: number, depthText: string): void {
+    kitronik_VIEW128x64.clear()
+    kitronik_VIEW128x64.show(label, 1)
+    kitronik_VIEW128x64.show(depthText, 2)
+    kitronik_VIEW128x64.show("Move: " + moveText, 3)
+    kitronik_VIEW128x64.show("Eval: " + formatEvalCentipawns(evalScore), 4)
+    kitronik_VIEW128x64.show("Time: " + Math.floor(elapsedMs / 1000) + "s", 5)
+    kitronik_VIEW128x64.show("B: back to menu", 7)
+}
+
+// Loads the position, runs the configured search on it, shows the board
+// with the chosen move already played plus the resulting eval and how
+// long the search took, then waits for B to return to the test menu.
+function runTestPosition (idx: number): void {
+    loadTestPosition(idx)
+    drawBoard()
+    let startTime = input.runningTime()
+    let mv = 0
+    let depthText = ""
+    if (testSearchMode == 0) {
+        mv = findBestMove(testSearchDepth)
+        depthText = "Depth: " + testSearchDepth + " (fixed)"
+    } else {
+        mv = findBestMoveTimed(testSearchMillis)
+        // lastCompletedDepth is the deepest ply findBestMoveTimed actually
+        // FINISHED within the time budget -- this is the number that
+        // answers "did more time actually let it search deeper", which a
+        // matching move alone can't (two different depths can agree on
+        // the same move, as depth 1 and depth 2 do for at least one of
+        // these hand-picked positions).
+        depthText = "Depth: " + lastCompletedDepth + " (in time)"
+    }
+    let elapsedMs = input.runningTime() - startTime
+    let moveText = moveName(mv)
+    makeMove(mv)
+    let evalScore = evaluate()
+    showTestResult(testLabels[idx], moveText, evalScore, elapsedMs, depthText)
+    let bLast = input.buttonIsPressed(Button.B)
+    while (true) {
+        let bNow = input.buttonIsPressed(Button.B)
+        let bPressed = bNow && !(bLast)
+        bLast = bNow
+        if (bPressed) {
+            break
+        }
+        basic.pause(100)
+    }
+}
+
+function testingMenuAndRun (): void {
+    testPositionIndex = runMenu("Test position", testLabels, testPositionIndex)
+    let modeChoice = runMenu("Search mode", ["By ply depth", "By time/move"], testSearchMode)
+    testSearchMode = modeChoice
+    if (testSearchMode == 0) {
+        let result = runValuePicker("Max ply depth", testSearchDepth, 1, 8, 1, "ply")
+        if (menuCancelled) {
+            return
+        }
+        testSearchDepth = result
+    } else {
+        let seconds = Math.floor(testSearchMillis / 1000)
+        let result = runValuePicker("Sec per move", seconds, 1, 600, 1, "sec")
+        if (menuCancelled) {
+            return
+        }
+        testSearchMillis = result * 1000
+    }
+    runTestPosition(testPositionIndex)
+}
+
+// Top-level menu, remembering the last-selected option (topMenuIndex) so
+// returning here after a game highlights whatever you picked last rather
+// than always resetting to the top.
+let topMenuIndex = 0
+function mainLoop (): void {
+    joystickbit.initJoystickBit()
+    while (true) {
+        topMenuIndex = runMenu("Ondsel Chess", ["Play vs Engine", "Self-play", "Testing"], topMenuIndex)
+        if (topMenuIndex == 0) {
+            strengthMenuAndPlay()
+        } else if (topMenuIndex == 1) {
+            selfPlayMenuAndRun()
+        } else {
+            testingMenuAndRun()
+        }
+    }
+}
+
+mainLoop()
